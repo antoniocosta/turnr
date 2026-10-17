@@ -3,7 +3,7 @@
 A [herdr](https://herdr.dev) plugin: a side panel that lists the turns of the coding agent next to it, so you can
 jump back to any earlier prompt with a click instead of scrolling for it.
 
-Works with **Claude Code**, **pi** and **Antigravity CLI (agy)**.
+Works with **Claude Code**, **Codex**, **pi** and **Antigravity CLI (agy)**.
 
 ## Why
 
@@ -76,6 +76,7 @@ that reads the text on stdin), `TURNR_RULE` (a theme role or `#rrggbb` for the f
 | Agent | The list comes from | The pane is moved with |
 | --- | --- | --- |
 | Claude Code | its session file (`~/.claude/projects/…`), read incrementally and cached | PgUp / Ctrl+End in batches, then a click on the pinned prompt header, which jumps to that prompt |
+| Codex | its rollout file (`~/.codex/sessions/…/rollout-*.jsonl`) | like pi: PgUp a page at a time, prompts recognised by their text (`› …`), wheel ticks to align |
 | pi | its session file (herdr reports the path) | PgUp one page at a time, mouse-wheel ticks to put the prompt on the top row; prompts are recognised on screen by their text |
 | agy | the screen: the `> ` prompt lines in herdr's scrollback | herdr's `pane.scroll`, a single exact call |
 
@@ -86,7 +87,7 @@ Limits:
   gone instead of guessing.
 - agy: only what is in the terminal's scrollback can be listed. No word and tool counts.
 - Claude Code must be in its fullscreen mode (`"tui": "fullscreen"`) for the pinned header that jumps rely on.
-- pi jumps page one page at a time, so a far turn in a long session takes seconds.
+- pi and Codex jump one page at a time, so a far turn in a long session takes seconds.
 
 ## Safety
 
@@ -96,13 +97,20 @@ view. That is the same thing you would do by hand, but it means a wrong guess ab
 somewhere they do not belong. So turnr:
 
 - sends keys only while `herdr agent get` reports an agent of the expected kind in that pane, and only when it is
-  `idle` or `working`: never when it is `blocked` (a dialog would take the keys) or when no agent is there (they would
+  `idle`, `done` or `working`: never when it is `blocked` (a dialog would take the keys) or when no agent is there (they would
   land in a shell);
 - sends no text that could be a command: only scroll keys, mouse events and, if Claude Code's transcript view was left
   open, a single `q` to leave it;
 - never edits or deletes session files. It only reads them, and keeps its own cache in `HERDR_PLUGIN_STATE_DIR`.
 
 Read the scripts before installing, as herdr advises for any plugin; they are short.
+
+## Adding an agent
+
+An adapter is two functions, registered in `lib/agents.py`: `load(pane, session)` returns the numbered turns (and the
+size of what they came from), and `jump(pane, n, session)` scrolls the pane to turn n. For an agent that scrolls
+itself, `lib/nav.py` does the paging and recognises prompts on screen, so an adapter is mostly a parser of the
+agent's session file (see `lib/codex.py`, about 80 lines). Send tests with made-up session files, never real ones.
 
 ## Development
 

@@ -26,9 +26,7 @@ import unicodedata
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 import herdr_style  # noqa: E402
-import agy
-import jump
-import pi  # noqa: E402
+import agents  # noqa: E402
 import turns  # noqa: E402
 
 HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
@@ -237,7 +235,7 @@ class Panel:
         self.theme = Theme()
         self.rev = revision()       # read once: it is the revision of the code this panel runs
         self.target = None          # the agent pane this panel shows
-        self.kind = "claude"        # which agent: "claude" and "pi" (JSONL file), "agy" (read off the screen)
+        self.kind = "claude"        # which agent: a key of agents.ADAPTERS
         self.session = None
         self.items = []
         self.sel = None             # the keyboard cursor: an index into self.items (drawn like a hover)
@@ -260,39 +258,25 @@ class Panel:
 
     # -- data ---------------------------------------------------------------------------------------
     def find_target(self):
-        agents = (herdr("agent", "list").get("agents")) or []
-        mine = [a for a in agents if a.get("tab_id") == self.tab and a.get("pane_id") != self.me
-                and a.get("agent") in ("claude", "agy", "pi")]
+        listing = (herdr("agent", "list").get("agents")) or []
+        mine = [a for a in listing if a.get("tab_id") == self.tab and a.get("pane_id") != self.me
+                and a.get("agent") in tuple(agents.ADAPTERS)]
         return next((a for a in mine if a.get("focused")), None) or next((a for a in mine if a["pane_id"] == self.target), None) \
             or (mine[0] if mine else None)
 
     def reload_items(self):
-        """Re-read the session file (only the lines added since last time)."""
-        if self.kind == "agy":
-            return                                  # read off the screen: refresh() does it, once per TARGET_POLL
-        path = self.session_path()
-        if not path:
+        """Re-read the session (only the lines added since last time). Agents read off the screen wait for refresh()."""
+        if self.kind == "agy" or not self.target:
             return
-        self.items = pi.load(path) if self.kind == "pi" else turns.load_cached(path)
-        self.size = os.path.getsize(path)
+        self.load_items()
         if self.follow:
             self.sel = len(self.items) - 1 if self.items else None
 
-    def session_path(self):
-        if not self.session:
-            return None
-        if self.kind == "pi":                          # herdr reports pi's session as the file path
-            return self.session if os.path.isfile(self.session) else None
-        return turns.find_session_file(self.session)
-
-    def scan_agy(self):
+    def load_items(self):
         try:
-            self.items = agy.scan(self.target)[0]
-        except agy.JumpError:
-            return
-        self.size = 0
-        if self.follow:
-            self.sel = len(self.items) - 1 if self.items else None
+            self.items, self.size = agents.ADAPTERS[self.kind].load(self.target, self.session)
+        except OSError:
+            pass
 
     def newest_turn(self):
         return max((i for i, it in enumerate(self.items) if it["kind"] == "turn" and not it.get("pending")), default=None)
@@ -301,19 +285,14 @@ class Panel:
         a = self.find_target()
         if not a:
             self.target, self.session, self.items = None, None, []
-            self.say("no Claude Code, pi or agy agent in this tab", 5)
+            self.say("no supported agent in this tab (Claude Code, Codex, pi, agy)", 5)
             return
         self.target = a["pane_id"]
         self.kind = a.get("agent") or "claude"
         sid = (a.get("agent_session") or {}).get("value") or (a["pane_id"] if self.kind == "agy" else None)
         if sid != self.session:
             self.session, self.sel, self.top, self.follow, self.current = sid, None, 0, True, None
-        if self.kind == "agy":
-            self.scan_agy()
-            return
-        path = self.session_path()
-        self.items = (pi.load(path) if self.kind == "pi" else turns.load_cached(path)) if path else []
-        self.size = os.path.getsize(path) if path else 0
+        self.load_items()
         if not self.items and time.time() > self.note_until:
             self.say("no turns yet", 5)
         if self.follow:
@@ -483,25 +462,18 @@ class Panel:
         if it.get("pending"):
             self.say("turn %d is still waiting in the queue" % it["n"])
             return
-        if i < self.last_compaction() and self.kind != "pi":     # pi keeps part of the compacted turns on screen
+        if i < self.last_compaction() and not agents.ADAPTERS[self.kind].keeps_compacted:
             self.detail = it["text"]
             return
         self.say("jumping to turn %d…" % it["n"], 30)
         self.draw(sys.stdout)
         try:
-            self.do_jump(it["n"])
+            agents.ADAPTERS[self.kind].jump(self.target, it["n"], self.session)
             herdr("agent", "focus", self.target)
             self.current = None if i == self.newest_turn() else i
             self.say("at turn %d" % it["n"], 8)
-        except (jump.JumpError, agy.JumpError, pi.JumpError) as e:
+        except (OSError, *{a.error for a in agents.ADAPTERS.values()}) as e:
             self.say(str(e)[:200], 8)
-
-    def do_jump(self, n):
-        if self.kind == "agy":
-            return agy.jump(self.target, n)
-        if self.kind == "pi":
-            return pi.jump(self.target, n, self.session_path())
-        return jump.jump_scroll(self.target, n)
 
     def copy_selected(self, out):
         text = self.detail if self.detail is not None else (

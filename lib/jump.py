@@ -18,7 +18,7 @@ import turns
 
 HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
 KEY_DELAY = float(os.environ.get("TURNR_KEY_DELAY", "0.25"))
-SAFE_STATES = ("idle", "working")
+SAFE_STATES = ("idle", "working", "done")
 
 
 class JumpError(Exception):

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+import nav  # noqa: E402
 import pi  # noqa: E402
 
 
@@ -45,11 +46,11 @@ class Find(unittest.TestCase):
     def test_prompt_is_found_by_its_first_line_on_a_background_row(self):
         seg = [{"text": "Fix the login bug\nmore detail"}, {"text": "Add tests"}]
         rows = [("", False), ("", True), (" Add tests for the parser", True), ("Add tests", False)]
-        self.assertEqual(pi._find(rows, seg), {1: 2})
+        self.assertEqual(nav.find(rows, seg), {1: 2})
 
     def test_answer_text_without_a_background_is_not_a_prompt(self):
         seg = [{"text": "Fix the login bug"}]
-        self.assertEqual(pi._find([("Fix the login bug", False)], seg), {})
+        self.assertEqual(nav.find([("Fix the login bug", False)], seg), {})
 
 
 if __name__ == "__main__":
