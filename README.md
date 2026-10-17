@@ -112,6 +112,10 @@ size of what they came from), and `jump(pane, n, session)` scrolls the pane to t
 itself, `lib/nav.py` does the paging and recognises prompts on screen, so an adapter is mostly a parser of the
 agent's session file (see `lib/codex.py`, about 80 lines). Send tests with made-up session files, never real ones.
 
+Other agents herdr knows (Cursor, opencode, Droid, Copilot, Amp and more) are not covered yet. Contributions are
+welcome: open an issue or a pull request with the adapter, or with an anonymised sample of the agent's session file and
+a note on how its terminal UI scrolls and draws prompts.
+
 ## Development
 
 ```
