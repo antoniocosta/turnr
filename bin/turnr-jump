@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""turnr-jump: put a Claude Code pane on turn N .
+
+    turnr-jump <pane-id> <turn-number> [--leave]
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import jump  # noqa: E402
+
+
+def main(argv):
+    args = [a for a in argv if not a.startswith("--")]
+    if len(args) != 2 or not args[1].isdigit():
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    try:
+        r = jump.jump_scroll(args[0], int(args[1]), log=(lambda m: print("turnr:", m, file=sys.stderr)) if "--verbose" in argv else (lambda m: None))
+        print("turnr: turn %(turn)d, %(sent)d page keys, %(corrections)d rounds: %(landed_on)s" % r)
+        if "--leave" in argv:
+            jump.leave(args[0])
+    except jump.JumpError as e:
+        print("turnr:", e, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

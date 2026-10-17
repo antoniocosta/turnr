@@ -1,0 +1,4 @@
+turnr reads herdr's theme so that the panel looks like herdr. `lib/herdr-themes.json` holds the colours of
+herdr's built-in themes, copied from herdr v0.9.1 (src/app/state.rs, `Palette`) and `lib/herdr_style.py` follows
+how herdr reads its config. herdr is Copyright its authors and licensed under the Apache License 2.0:
+https://github.com/herdrdev/herdr

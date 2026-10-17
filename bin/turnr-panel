@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""turnr-panel: the turns of the agent (Claude Code, pi or agy) next to it, in a side panel.
+
+    turnr-panel --toggle     the keybinding's action: open the panel beside the focused pane, or close it
+    turnr-panel              the panel itself (herdr runs this in the pane)
+
+Each turn sits under a rule that carries its number (── 98 ────). Keys: j/k or arrows move, PgUp/PgDn page,
+g/G first/last, Enter or a click jumps the agent's pane to that turn (turns above the last compaction open as
+text here instead), y copies the turn's text, m switches the mouse to selecting text and back, q closes.
+Colours come from herdr's theme (lib/herdr_style.py).
+"""
+import base64
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import textwrap
+import time
+import tty
+import unicodedata
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import herdr_style  # noqa: E402
+import agy
+import jump
+import pi  # noqa: E402
+import turns  # noqa: E402
+
+HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
+PLUGIN = "turnr"
+HOVER_SECONDS = float(os.environ.get("TURNR_HOVER_SECONDS", "1.2"))   # no "mouse left" event exists: fade when it stops moving
+POLL = 0.4              # how often the file is looked at (cheap: it reads only new lines)
+TARGET_POLL = 1.5       # how often herdr is asked which agent is next to the panel
+MOUSE_ON = "\x1b[?1000h\x1b[?1003h\x1b[?1006h"
+MOUSE_OFF = "\x1b[?1003l\x1b[?1000l\x1b[?1006l"
+RESET = "\x1b[0m"
+RULE_ROLE = os.environ.get("TURNR_RULE", "rule")   # herdr draws its dividers in surface_dim: the panel colour, invisible on tokyo-night
+PANEL_WIDTH = int(os.environ.get("TURNR_WIDTH", "48"))   # text columns
+FRAME = 2                                                # columns herdr's pane frame takes: 48 wide shows 46
+
+# ratatui's named colours as terminal colour numbers (Reset: the terminal's own)
+NAMED = {"Black": 0, "Red": 1, "Green": 2, "Yellow": 3, "Blue": 4, "Magenta": 5, "Cyan": 6, "Gray": 7,
+         "DarkGray": 8, "LightRed": 9, "LightGreen": 10, "LightYellow": 11, "LightBlue": 12,
+         "LightMagenta": 13, "LightCyan": 14, "White": 15, "Reset": -1}
+FALLBACK = {"rule": "#383a4c", "active_row_bg": "#1e1e2e", "selection_bg": "#313244", "subtext0": "#a6adc8", "text": "#cdd6f4", "overlay0": "#6c7086", "overlay1": "#7f849c",
+            "surface0": "#313244", "surface1": "#45475a", "surface_dim": "#1e1e2e", "accent": "#89b4fa", "mauve": "#cba6f7",
+            "yellow": "#f9e2af"}
+
+
+def herdr(*args):
+    try:
+        r = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=15)
+        return json.loads(r.stdout).get("result") or {} if r.stdout.strip().startswith("{") else {}
+    except Exception:
+        return {}
+
+
+def toggle():
+    """Close the panels turnr has open in this tab, or if there are none open one beside the focused pane.
+    Herdr's own pane list is the truth (a pid file goes stale when one panel exits after another started)."""
+    focused = os.environ.get("HERDR_PANE_ID")
+    tab = (herdr("pane", "get", focused).get("pane") or {}).get("tab_id") if focused else None
+    panes = herdr("pane", "list").get("panes") or []
+    mine = [p for p in panes if p.get("label") == PLUGIN and not p.get("agent")
+            and (tab is None or p.get("tab_id") == tab)]
+    if mine:
+        for p in mine:
+            herdr("pane", "close", p["pane_id"])
+        return 0
+    args = ["plugin", "pane", "open", "--plugin", PLUGIN, "--entrypoint", "panel", "--placement", "split",
+            "--direction", "right", "--no-focus"]
+    if focused:
+        args += ["--target-pane", focused]
+    herdr(*args)
+    return 0
+
+
+# ── colour: herdr's theme ───────────────────────────────────────────────────────────────────────
+class Theme:
+    """The palette herdr is configured with (re-read every 30 s: a theme change shows without a restart)."""
+
+    def __init__(self):
+        self.pal, self.read_at = dict(FALLBACK), 0.0
+
+    def load(self):
+        if time.time() - self.read_at < 30:
+            return
+        self.read_at = time.time()
+        try:
+            self.pal = {**FALLBACK, **herdr_style.style()["palette"]}
+        except Exception:
+            pass                                   # keep the colours we have
+        for role, fallback in (("active_row_bg", "surface1"), ("selection_bg", "surface0")):
+            if self.pal.get(role) in (None, "Reset"):       # a theme (terminal) leaves it to the terminal: still show it
+                self.pal[role] = self.pal.get(fallback, FALLBACK[fallback])
+        # the rule between turns: between herdr's divider colour (surface_dim, invisible here) and surface1
+        self.pal["rule"] = self.mix(self.pal.get("surface_dim", "Reset"), self.pal.get("surface1", "Reset"), 0.65)
+
+    @staticmethod
+    def mix(a, b, t):
+        """Colour a moved t of the way toward b (both #rrggbb); b when either is not a hex colour."""
+        if all(isinstance(c, str) and c.startswith("#") and len(c) == 7 for c in (a, b)):
+            ra, rb = [int(a[i:i + 2], 16) for i in (1, 3, 5)], [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+            return "#%02x%02x%02x" % tuple(int(x + (y - x) * t) for x, y in zip(ra, rb))
+        return b
+
+    @staticmethod
+    def code(spec, bg=False):
+        if spec.startswith("#") and len(spec) == 7:
+            return "%d;2;%d;%d;%d" % ((48 if bg else 38,) + tuple(int(spec[i:i + 2], 16) for i in (1, 3, 5)))
+        c = NAMED.get(spec, -1)
+        if c < 0:
+            return "49" if bg else "39"
+        return str((40 if bg else 30) + c) if c < 8 else str((100 if bg else 90) + c - 8)
+
+    def fg(self, role):
+        return self.code(self.pal.get(role, "Reset"))
+
+    def bg(self, role):
+        return self.code(self.pal.get(role, "Reset"), bg=True)
+
+
+def fit_width(pane):
+    """Herdr splits half and half: bring this pane to PANEL_WIDTH text columns, the way herdr's own side panels sit (it
+    measures the layout and moves the split line; herdr rounds to whole columns, so measure again)."""
+    resize = lambda d, a: herdr("pane", "resize", "--pane", pane, "--direction", d, "--amount", "%.4f" % a)
+    for attempt in range(4):
+        lay = herdr("pane", "layout", "--pane", pane).get("layout") or {}
+        me = next((p["rect"] for p in lay.get("panes") or [] if p["pane_id"] == pane), None)
+        if not me:
+            return
+        inside = lambda r: r["x"] <= me["x"] and r["x"] + r["width"] >= me["x"] + me["width"] \
+            and r["y"] <= me["y"] and r["y"] + r["height"] >= me["y"] + me["height"]
+        splits = [sp for sp in lay.get("splits") or [] if sp["direction"] == "right" and inside(sp["rect"])
+                  and sp["rect"]["x"] < me["x"]]
+        if not splits:
+            return
+        split = min(splits, key=lambda sp: sp["rect"]["width"] * sp["rect"]["height"])
+        off = me["width"] - (PANEL_WIDTH + FRAME)
+        if not off:
+            if not attempt:                      # right already: there and back, which makes herdr resize the terminal
+                step = 1 / split["rect"]["width"]
+                resize("left", step)
+                resize("right", step)
+            return
+        resize("right" if off > 0 else "left", abs(off) / split["rect"]["width"])
+
+
+def cwidth(s):
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
+
+def clip(s, width):
+    out, w = "", 0
+    for c in s:
+        cw = cwidth(c)
+        if w + cw > width:
+            break
+        out, w = out + c, w + cw
+    return out
+
+
+class Line:
+    """A line made of (text, role, bold) pieces; roles are palette names. render() paints them, with an optional
+    background role under the whole width."""
+
+    def __init__(self):
+        self.segs = []
+
+    def add(self, text, role="text", bold=False):
+        self.segs.append((text, role, bold))
+        return self
+
+    def width(self):
+        return sum(cwidth(t) for t, _, _ in self.segs)
+
+    def render(self, theme, cols, bg=None):
+        out, used = [], 0
+        for text, role, bold in self.segs:
+            text = clip(text, cols - used)
+            if not text:
+                continue
+            used += cwidth(text)
+            codes = [theme.fg(role)] + (["1"] if bold else []) + ([theme.bg(bg)] if bg else [])
+            out.append("\x1b[%sm%s" % (";".join(codes), text))
+        if bg and used < cols:
+            out.append("\x1b[%sm%s" % (theme.bg(bg), " " * (cols - used)))
+        return "".join(out) + RESET
+
+
+def copy_text(text, out):
+    """Put `text` on the clipboard: with pbcopy (or $TURNR_COPY) where the panel runs, else the terminal's own
+    clipboard (OSC 52), which most terminals take and tmux-like programs pass on. → how."""
+    cmd = os.environ.get("TURNR_COPY") or ("pbcopy" if shutil.which("pbcopy") else None)
+    if cmd:
+        try:
+            subprocess.run(cmd, shell=True, input=text.encode(), timeout=3, check=True)
+            return "clipboard"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    out.write("\x1b]52;c;" + base64.b64encode(text.encode()).decode() + "\x07")
+    out.flush()
+    return "terminal clipboard"
+
+
+def words_text(n):
+    return "%.1fk words" % (n / 1000.0) if n >= 1000 else "%d word%s" % (n, "" if n == 1 else "s")
+
+
+def revision():
+    """The short git revision of the turnr checkout this panel is running from, or "" (no git, not a checkout)."""
+    try:
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        r = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def human_size(n):
+    return "%.0f MB" % (n / 1e6) if n >= 1e7 else "%.1f MB" % (n / 1e6) if n >= 1e5 else "%d KB" % max(1, n // 1000)
+
+
+def ui_file():
+    return os.path.join(turns._state_dir(), "ui.json")
+
+
+class Panel:
+    def __init__(self):
+        self.me = os.environ.get("HERDR_PANE_ID")
+        self.tab = (herdr("pane", "get", self.me).get("pane") or {}).get("tab_id") if self.me else None
+        self.theme = Theme()
+        self.rev = revision()       # read once: it is the revision of the code this panel runs
+        self.target = None          # the agent pane this panel shows
+        self.kind = "claude"        # which agent: "claude" and "pi" (JSONL file), "agy" (read off the screen)
+        self.session = None
+        self.items = []
+        self.sel = None             # the keyboard cursor: an index into self.items (drawn like a hover)
+        self.current = None         # the turn the agent's view is at (strong highlight); None: the newest
+        self.size = 0               # bytes of the session file
+        self.top = 0                # first visible line (when not following)
+        self.follow = True          # stay on the newest turn until the user moves
+        self.note = ""
+        self.note_until = 0.0
+        self.detail = None
+        self.last_frame = None
+        self.rows_at = {}           # screen row (1-based) → item index
+        self.hover = None
+        self.hover_at = 0.0
+        self.line_cache = {}
+        try:
+            self.mouse = bool(json.load(open(ui_file())).get("mouse", True))
+        except (OSError, ValueError):
+            self.mouse = True
+
+    # -- data ---------------------------------------------------------------------------------------
+    def find_target(self):
+        agents = (herdr("agent", "list").get("agents")) or []
+        mine = [a for a in agents if a.get("tab_id") == self.tab and a.get("pane_id") != self.me
+                and a.get("agent") in ("claude", "agy", "pi")]
+        return next((a for a in mine if a.get("focused")), None) or next((a for a in mine if a["pane_id"] == self.target), None) \
+            or (mine[0] if mine else None)
+
+    def reload_items(self):
+        """Re-read the session file (only the lines added since last time)."""
+        if self.kind == "agy":
+            return                                  # read off the screen: refresh() does it, once per TARGET_POLL
+        path = self.session_path()
+        if not path:
+            return
+        self.items = pi.load(path) if self.kind == "pi" else turns.load_cached(path)
+        self.size = os.path.getsize(path)
+        if self.follow:
+            self.sel = len(self.items) - 1 if self.items else None
+
+    def session_path(self):
+        if not self.session:
+            return None
+        if self.kind == "pi":                          # herdr reports pi's session as the file path
+            return self.session if os.path.isfile(self.session) else None
+        return turns.find_session_file(self.session)
+
+    def scan_agy(self):
+        try:
+            self.items = agy.scan(self.target)[0]
+        except agy.JumpError:
+            return
+        self.size = 0
+        if self.follow:
+            self.sel = len(self.items) - 1 if self.items else None
+
+    def newest_turn(self):
+        return max((i for i, it in enumerate(self.items) if it["kind"] == "turn" and not it.get("pending")), default=None)
+
+    def refresh(self):
+        a = self.find_target()
+        if not a:
+            self.target, self.session, self.items = None, None, []
+            self.say("no Claude Code, pi or agy agent in this tab", 5)
+            return
+        self.target = a["pane_id"]
+        self.kind = a.get("agent") or "claude"
+        sid = (a.get("agent_session") or {}).get("value") or (a["pane_id"] if self.kind == "agy" else None)
+        if sid != self.session:
+            self.session, self.sel, self.top, self.follow, self.current = sid, None, 0, True, None
+        if self.kind == "agy":
+            self.scan_agy()
+            return
+        path = self.session_path()
+        self.items = (pi.load(path) if self.kind == "pi" else turns.load_cached(path)) if path else []
+        self.size = os.path.getsize(path) if path else 0
+        if not self.items and time.time() > self.note_until:
+            self.say("no turns yet", 5)
+        if self.follow:
+            self.sel = len(self.items) - 1 if self.items else None
+
+    # -- drawing ------------------------------------------------------------------------------------
+    def last_compaction(self):
+        return max((i for i, it in enumerate(self.items) if it["kind"] == "compaction"), default=-1)
+
+    def item_lines(self, i, cols, cut, state=None):
+        """The lines of one item, as Line objects: for a turn its numbered rule and up to two lines of text.
+        state "sel": the turn the agent is at (herdr's active row); "hover": the cursor or the mouse (herdr's
+        navigate-mode cursor row). Colours follow herdr's sidebar. Cached: only the items whose state changes
+        are drawn again."""
+        it = self.items[i]
+        key = (i, cols, i < cut, state, it.get("pending"), it.get("n"), len(it.get("text", "")), it["kind"], it.get("words"), it.get("tools"))
+        hit = self.line_cache.get(key)
+        if hit is not None:
+            return hit
+        sel = state == "sel"
+        if it["kind"] == "compaction":
+            # herdr: dividers are ─ in surface_dim, a section label is overlay0 bold (" spaces", " agents")
+            ln = Line().add("── ", RULE_ROLE).add("compacted", "overlay0", True).add(" ", RULE_ROLE)
+            lines = [ln.add("─" * max(0, cols - ln.width()), RULE_ROLE)]
+        else:
+            rule_c = RULE_ROLE if state is None else "surface1"   # stays visible on the cursor/hover row
+            label = " %d " % it["n"] + ("~ waiting " if it.get("pending") else "")
+            # herdr's own mapping for a sidebar row: the number is text on the active row, overlay1 under the
+            # cursor, overlay0 otherwise; secondary text is overlay0 (mauve on the active row)
+            num_c = "yellow" if it.get("pending") else ("text" if sel else ("overlay1" if state == "hover" else "overlay0"))
+            rule = Line().add("─", rule_c).add(label, num_c)
+            parts = ([words_text(it["words"])] if it.get("words") else []) \
+                + (["%d tool%s" % (it["tools"], "" if it["tools"] == 1 else "s")] if it.get("tools") else [])
+            # the stats sit at the right end of the rule: ─ 226 ───── 1.8k words · 164 tools ─
+            while parts and rule.width() + cwidth(" " + " · ".join(parts) + " ─") + 2 > cols:
+                parts.pop()                              # too narrow: drop the last stat first
+            if parts:
+                right = " " + " · ".join(parts) + " "
+                rule.add("─" * (cols - rule.width() - cwidth(right) - 1), rule_c)
+                rule.add(right, "mauve" if sel else "overlay0")
+                rule.add("─", rule_c)
+            else:
+                rule.add("─" * max(0, cols - rule.width()), rule_c)
+            # the name: text, bold, on the active row; subtext0 on the others (herdr: workspace_style); the turns
+            # the model only knows through a summary are secondary text
+            role = "text" if sel else ("subtext0" if i >= cut else "overlay0")
+            text = re.sub(r"\s+", " ", it["text"]).strip()
+            room = max(8, cols - 1)
+            wrapped = textwrap.wrap(text[: room * 3], room, break_long_words=True) or [""]
+            if len(wrapped) > 2 or len(text) > room * 2:
+                wrapped = wrapped[:2]
+                wrapped[1] = wrapped[1][: room - 1] + "…" if len(wrapped[1]) >= room else wrapped[1] + "…"
+            lines = [rule] + [Line().add(" " + w, role, sel) for w in wrapped]
+        if len(self.line_cache) > 20000:
+            self.line_cache.clear()
+        self.line_cache[key] = lines
+        return lines
+
+    def frame(self):
+        self.theme.load()
+        cols, rows = shutil.get_terminal_size((40, 24))
+        body = max(1, rows - 4)                           # a blank line, the rule and the two status lines
+        th = self.theme
+        self.rows_at = {}
+        count = sum(1 for x in self.items if x["kind"] == "turn")
+        body_lines = []                                   # rendered strings
+        if self.detail is not None:
+            for para in self.detail.splitlines() or [""]:
+                body_lines += [Line().add(w).render(th, cols) for w in (textwrap.wrap(para, cols) or [""])]
+            body_lines = body_lines[:body]
+            hint = Line().add("any key", "text", True).add(" back  ", "overlay0").add("y", "text", True).add(" copy", "overlay0")
+        elif not self.items:
+            body_lines = [Line().add(self.note or "", "overlay0").render(th, cols)]
+            hint = Line().add("q", "text", True).add(" close", "overlay0")
+        else:
+            cut = self.last_compaction()
+            here = self.current if self.current is not None else self.newest_turn()
+            state_of = lambda i: "sel" if i == here else ("hover" if i in (self.sel, self.hover) else None)
+            flat, owner, first_of = [], [], {}            # every line of every item, whose it is, where each starts
+            for i in range(len(self.items)):
+                lines = self.item_lines(i, cols, cut, state_of(i))
+                first_of[i] = len(flat)
+                flat += lines
+                owner += [i] * len(lines)
+            total = len(flat)
+            if self.follow or self.sel is None:
+                top = max(0, total - body)
+            else:
+                top = self.top
+                a = first_of[self.sel]
+                b = a + len(self.item_lines(self.sel, cols, cut, state_of(self.sel))) - 1
+                top = a if a < top else (b - body + 1 if b >= top + body else top)
+                top = max(0, min(top, max(0, total - body)))
+            self.top = top
+            window = range(top, min(total, top + body))
+            pad = body - len(window)                      # a short list sits at the bottom: no gap above the status
+            body_lines = [""] * pad
+            for k, ln in enumerate(window):
+                i = owner[ln]
+                bg = None
+                if self.items[i]["kind"] == "turn":
+                    st = state_of(i)
+                    # herdr's own roles: the active row (where the agent is) and the Navigate-mode cursor row
+                    bg = "active_row_bg" if st == "sel" else ("selection_bg" if st == "hover" else None)
+                    self.rows_at[pad + k + 1] = i
+                body_lines.append(flat[ln].render(th, cols, bg))
+            hint = (Line().add("q", "text", True).add(" close ", "overlay0").add(" ↑↓", "text", True)
+                    .add(" ", "overlay0").add(" ⏎", "text", True).add(" jump ", "overlay0").add(" y", "text", True)
+                    .add(" copy ", "overlay0").add(" m", "text", True)
+                    .add(" select" if self.mouse else " click", "overlay0"))
+        body_lines += [""] * (body - len(body_lines))
+        if self.note and time.time() < self.note_until:
+            hint = Line().add(self.note, "text", True)
+        rule = Line().add("─ ", "overlay0").add("turnr", "text", True)
+        if self.rev:
+            rule.add(" · @" + self.rev, "overlay0")
+        rule.add(" ", "overlay0")
+        rule.add("─" * max(0, cols - rule.width()), "overlay0")
+        comp = sum(1 for x in self.items if x["kind"] == "compaction")
+        stats = [self.target or "-"] + (["%d turns" % count] if count else []) + (["%d compacted" % comp] if comp else []) \
+            + ([human_size(self.size)] if self.size else [])
+        head = Line().add(" · ".join(stats), "overlay0")
+        return body_lines + [""] + [rule.render(th, cols), head.render(th, cols), hint.render(th, cols)]
+
+    def draw(self, out, force=False):
+        lines = self.frame()
+        key = "\n".join(lines) + str(shutil.get_terminal_size((40, 24)))
+        if key == self.last_frame and not force:
+            return                                        # nothing changed: write nothing, so nothing flickers
+        self.last_frame = key
+        # Overwrite in place (no clear), each line erased to its end, inside one synchronized update.
+        cols = shutil.get_terminal_size((40, 24)).columns
+        # Erase each line's leftover, except on a line that fills the width: the cursor sits on its last
+        # character then, and erasing from there would wipe it.
+        el = lambda l: "" if cwidth(re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", l)) >= cols else "\x1b[K"
+        buf = ["\x1b[?2026h\x1b[H"]
+        for n, ln in enumerate(lines):
+            buf.append(ln + el(ln) + ("\r\n" if n < len(lines) - 1 else ""))
+        buf.append("\x1b[J\x1b[?2026l")
+        out.write("".join(buf))
+        out.flush()
+
+    # -- actions ------------------------------------------------------------------------------------
+    def say(self, text, seconds=6):
+        self.note, self.note_until = text, time.time() + seconds
+
+    def move(self, delta=None, to=None):
+        if not self.items:
+            return
+        self.follow = False
+        cur = self.sel if self.sel is not None else len(self.items) - 1
+        cur = to if to is not None else cur + delta
+        self.sel = max(0, min(len(self.items) - 1, cur))
+        if self.items[self.sel]["kind"] == "compaction":      # land on turns, not on dividers
+            step = 1 if (delta or 1) > 0 else -1
+            nxt = self.sel + step
+            if 0 <= nxt < len(self.items):
+                self.sel = nxt
+        if self.sel == len(self.items) - 1:
+            self.follow = True
+
+    def activate(self, i=None):
+        i = self.sel if i is None else i
+        if i is None or i >= len(self.items) or self.items[i]["kind"] != "turn" or not self.target:
+            return
+        it = self.items[i]
+        if it.get("pending"):
+            self.say("turn %d is still waiting in the queue" % it["n"])
+            return
+        if i < self.last_compaction() and self.kind != "pi":     # pi keeps part of the compacted turns on screen
+            self.detail = it["text"]
+            return
+        self.say("jumping to turn %d…" % it["n"], 30)
+        self.draw(sys.stdout)
+        try:
+            self.do_jump(it["n"])
+            herdr("agent", "focus", self.target)
+            self.current = None if i == self.newest_turn() else i
+            self.say("at turn %d" % it["n"], 8)
+        except (jump.JumpError, agy.JumpError, pi.JumpError) as e:
+            self.say(str(e)[:200], 8)
+
+    def do_jump(self, n):
+        if self.kind == "agy":
+            return agy.jump(self.target, n)
+        if self.kind == "pi":
+            return pi.jump(self.target, n, self.session_path())
+        return jump.jump_scroll(self.target, n)
+
+    def copy_selected(self, out):
+        text = self.detail if self.detail is not None else (
+            self.items[self.sel]["text"] if self.sel is not None and self.items[self.sel]["kind"] == "turn" else None)
+        if text is None:
+            return
+        self.say("copied to the " + copy_text(text, out), 3)
+
+
+def read_keys(fd):
+    data = os.read(fd, 4096).decode("utf-8", "ignore")
+    keys, i = [], 0
+    while i < len(data):
+        if data.startswith("\x1b[<", i):                       # SGR mouse: ESC [ < b ; x ; y M|m
+            j = i + 3
+            while j < len(data) and data[j] not in "Mm":
+                j += 1
+            try:
+                b, x, y = (int(v) for v in data[i + 3:j].split(";"))
+                if data[j:j + 1] == "M" and b == 0:
+                    keys.append(("click", y))
+                elif data[j:j + 1] == "M" and 32 <= b < 64 and b & 3 == 3:     # motion with no button held
+                    keys.append(("move", y))
+                elif b == 64:
+                    keys.append(("up", None))
+                elif b == 65:
+                    keys.append(("down", None))
+            except ValueError:
+                pass
+            i = j + 1
+        elif data.startswith("\x1b[A", i):
+            keys.append(("up", None)); i += 3
+        elif data.startswith("\x1b[B", i):
+            keys.append(("down", None)); i += 3
+        elif data.startswith("\x1b[5~", i):
+            keys.append(("pgup", None)); i += 4
+        elif data.startswith("\x1b[6~", i):
+            keys.append(("pgdn", None)); i += 4
+        else:
+            keys.append(("char", data[i])); i += 1
+    return keys
+
+
+def run():
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGWINCH, lambda *_: None)      # wakes select(); draw() sees the new size
+    p = Panel()
+    out = sys.stdout
+    if p.me:
+        try:
+            fit_width(p.me)
+        except Exception:
+            pass                                 # an odd layout reply: leave the width as herdr made it
+    tty.setcbreak(fd)
+    out.write("\x1b[?1049h\x1b[?25l" + (MOUSE_ON if p.mouse else ""))
+    try:
+        last = 0.0
+        p.refresh()
+        p.draw(out)
+        while True:
+            ready, _, _ = select.select([fd], [], [], POLL)
+            if ready:
+                for kind, val in read_keys(fd):
+                    if p.detail is not None:
+                        if kind == "char" and val in ("y", "Y"):
+                            p.copy_selected(out)
+                        else:
+                            p.detail = None
+                    elif kind == "char" and val in ("q", "Q"):
+                        return 0
+                    elif kind == "up" or (kind == "char" and val == "k"):
+                        p.move(-1)
+                    elif kind == "down" or (kind == "char" and val == "j"):
+                        p.move(+1)
+                    elif kind == "pgup":
+                        p.move(-(shutil.get_terminal_size((40, 24)).lines - 4))
+                    elif kind == "pgdn":
+                        p.move(+(shutil.get_terminal_size((40, 24)).lines - 4))
+                    elif kind == "char" and val == "g":
+                        p.move(to=0)
+                    elif kind == "char" and val == "G":
+                        p.move(to=len(p.items) - 1)
+                    elif kind == "char" and val in ("\r", "\n"):
+                        p.activate()
+                    elif kind == "char" and val in ("y", "Y"):
+                        p.copy_selected(out)
+                    elif kind == "char" and val in ("m", "M"):
+                        p.mouse = not p.mouse             # off: the terminal selects text itself
+                        p.hover = None
+                        out.write(MOUSE_ON if p.mouse else MOUSE_OFF)
+                        try:
+                            json.dump({"mouse": p.mouse}, open(ui_file(), "w"))
+                        except OSError:
+                            pass
+                    elif kind == "move":
+                        p.hover, p.hover_at = p.rows_at.get(val), time.time()
+                    elif kind == "click":
+                        i = p.rows_at.get(val)
+                        if i is not None and p.items[i]["kind"] == "turn":
+                            p.sel, p.follow = i, False
+                            p.activate(i)
+            if p.hover is not None and time.time() - p.hover_at > HOVER_SECONDS:
+                p.hover = None
+            if time.time() - last >= TARGET_POLL:
+                last = time.time()
+                p.refresh()
+            else:
+                p.reload_items()
+            p.draw(out)
+    finally:
+        out.write(MOUSE_OFF + "\x1b[?25h\x1b[?1049l")
+        out.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+if __name__ == "__main__":
+    sys.exit(toggle() if "--toggle" in sys.argv[1:] else run())

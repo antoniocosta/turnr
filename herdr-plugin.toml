@@ -1,0 +1,22 @@
+## turnr: a side panel listing the turns of an agent (Claude Code, pi, agy); select one to jump the agent's pane there.
+
+id = "turnr"
+name = "turnr"
+version = "0.1.0"
+min_herdr_version = "0.9.4"
+description = "Side panel listing an agent's turns (Claude Code, pi, agy); click one to scroll the pane there."
+platforms = ["linux", "macos"]
+
+# The panel: a split on the right of the pane that was focused when the key was pressed.
+[[panes]]
+id = "panel"
+title = "turnr"
+placement = "split"
+command = ["bin/turnr-panel"]
+
+# A keybinding names an action, not a pane: this one opens the panel, or closes it if open.
+[[actions]]
+id = "toggle"
+title = "Toggle turnr"
+contexts = ["workspace"]
+command = ["bin/turnr-panel", "--toggle"]
