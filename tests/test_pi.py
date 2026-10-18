@@ -37,6 +37,14 @@ class Load(unittest.TestCase):
         self.assertEqual(items[2]["n"], 2)
         self.assertEqual(items[2]["compactions_above"], 1)
 
+    def test_a_turns_answer_is_read_from_the_file(self):
+        p = session([msg("user", {"type": "text", "text": "first"}),
+                     msg("assistant", {"type": "toolCall", "name": "bash", "arguments": {"command": "ls"}},
+                         {"type": "text", "text": "Here."}),
+                     msg("user", {"type": "text", "text": "second"}), msg("assistant", {"type": "text", "text": "No."})])
+        self.assertEqual(pi.answer(p, 1), [("tool", "bash  ls"), ("text", "Here.")])
+        self.assertEqual(pi.answer(p, 2), [("text", "No.")])
+
     def test_slash_commands_are_not_turns(self):
         p = session([msg("user", {"type": "text", "text": "/new"}), msg("user", {"type": "text", "text": "real"})])
         self.assertEqual(len(pi.load(p)), 1)

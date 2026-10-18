@@ -56,6 +56,7 @@ macOS, and Python 3 (standard library only).
 | --- | --- |
 | click, or `Enter` | scroll the agent's pane to that turn and focus it |
 | `j` / `k`, arrows, `PgUp` / `PgDn`, `g` / `G` | move through the list |
+| `o` | read the whole turn in the panel: your prompt and the agent's answer, from the session file (`← back` or `Esc` returns) |
 | `y` | copy the selected turn's text (`pbcopy`, `$TURNR_COPY`, or the terminal clipboard via OSC 52) |
 | click `⌕`, or `p` | pin the turn (click `unpin`, or `p` again, to unpin) |
 | `m` | let the terminal select text instead of the mouse driving the panel (and back) |
@@ -67,6 +68,13 @@ is already at does nothing but focus the agent. Hovering or moving the cursor hi
 to the end of its answer. A prompt relayed by another session through herdr shows its sender short
 (`Stash › D-57 …` for `[From Stash (~/dev/Stash) via herdr] D-57 …`). A prompt typed while the agent was busy shows at once as `~ waiting`. Dividers mark
 compactions.
+
+Every turn is in the agent's session file, its answer too, even after a compaction and after the agent has
+dropped it from its screen. `o` opens the selected turn in the panel as a reader: the prompt, then the answer's text,
+with each tool call as one `⏺` line (`⏺ Bash  git status`). Scroll it with the arrows, the wheel, `Space` / `b` or
+`PgUp` / `PgDn`, `g` / `G`; `y` copies the prompt and the answer; `← back` (top left), `Esc` or `q` returns to the
+list. A turn the agent no longer has on screen opens there by itself when you click it, which makes a pinned old turn
+still worth its pin.
 
 Pin the turns you keep coming back to: hover the `⌕` after a turn's number and it becomes `⚲ pin`; click it and the turn
 moves to a block at the bottom of the list, just above the status lines, which stays in view however many turns pile up
@@ -92,11 +100,11 @@ that reads the text on stdin), `TURNR_RULE` (a theme role or `#rrggbb` for the f
 Limits:
 
 - Turns before a compaction are jumped to while the agent still has them on screen (Claude Code and pi keep them); one
-  that is gone opens as text in the panel instead.
+  that is gone opens in the panel's reader instead.
 - Claude Code: a prompt typed while it was working is brought into view but not to the top row (it never becomes the
   pinned header the click needs). Two identical prompts in a row with long answers between (`yes`, `yes`) can be
   impossible to tell apart: turnr then says so rather than guessing.
-- agy: only what is in the terminal's scrollback can be listed. No word and tool counts.
+- agy: only what is in the terminal's scrollback can be listed. No word and tool counts, and no reader.
 - Claude Code must be in its fullscreen mode (`"tui": "fullscreen"`) for the pinned header that jumps rely on.
 - pi and Codex jump one page at a time, so a far turn in a long session takes seconds.
 

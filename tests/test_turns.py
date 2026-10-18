@@ -74,5 +74,22 @@ class ReadItems(unittest.TestCase):
         self.assertEqual([i["text"] for i in turns.load(p)], ["Failed to load resource: 401", "see \nx = 1\n and fix it"])
 
 
+class ReadAnswer(unittest.TestCase):
+    def test_a_turns_answer_is_its_text_and_tool_calls_up_to_the_next_turn(self):
+        p = write([user("first"), assistant({"type": "thinking", "thinking": "hm"}, {"type": "text", "text": "Looking."}),
+                   assistant({"type": "tool_use", "name": "Bash", "input": {"command": "ls  -la\nlib"}}),
+                   {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": "x"}]}},
+                   assistant({"type": "text", "text": "Done."}), user("second"), assistant({"type": "text", "text": "Next."})])
+        items = turns.load(p)
+        self.assertEqual(turns.read_answer(p, items[0]["byte"], items[1]["byte"]),
+                         [("text", "Looking."), ("tool", "Bash  ls -la lib"), ("text", "Done.")])
+        self.assertEqual(turns.read_answer(p, items[1]["byte"]), [("text", "Next.")])
+
+    def test_a_tool_is_summed_up_by_what_it_was_called_on(self):
+        self.assertEqual(turns.tool_line("Read", {"file_path": "/a/b.py", "limit": 5}), "Read  /a/b.py")
+        self.assertEqual(turns.tool_line("shell", '{"command": ["git", "status"]}'), "shell  git status")
+        self.assertEqual(turns.tool_line("TaskStop", {}), "TaskStop")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,9 +5,10 @@
     turnr-panel              the panel itself (herdr runs this in the pane)
 
 Each turn sits under a rule that carries its number (── 98 ────). Keys: j/k or arrows move, PgUp/PgDn page,
-g/G first/last, Enter or a click jumps the agent's pane to that turn (turns above the last compaction open as
-text here instead), y copies the turn's text, p pins it (or a click on its ⌕), m switches the mouse to selecting
-text and back, q closes. Pinned turns stay in a block above the status lines, remembered per session.
+g/G first/last, Enter or a click jumps the agent's pane to that turn, o opens the whole turn here (its prompt and
+answer, read from the session file; a turn the agent no longer has on screen opens here by itself; ← back or Esc
+returns), y copies the turn's text, p pins it (or a click on its ⌕), m switches the mouse to selecting text and
+back, q closes. Pinned turns stay in a block above the status lines, remembered per session.
 Colours come from herdr's theme (lib/herdr_style.py).
 """
 import base64
@@ -256,7 +257,8 @@ class Panel:
         self.follow = True          # stay on the newest turn until the user moves
         self.note = ""
         self.note_until = 0.0
-        self.detail = None
+        self.reader = None          # the turn open in the reader: {"i", "n", "top", "blocks", "sig"}
+        self.gone = set()           # turn numbers the agent no longer has on screen (a jump said so): open in the reader
         self.last_frame = None
         self.rows_at = {}           # screen row (1-based) → item index
         self.hover = None
@@ -297,7 +299,7 @@ class Panel:
     def sync_view(self):
         """Follow the agent's view: when it has scrolled to another turn, highlight that turn and bring it into the
         list. Only reads the agent's screen."""
-        if not self.target or self.detail is not None or time.time() - self.view_at < VIEW_POLL:
+        if not self.target or self.reader is not None or time.time() - self.view_at < VIEW_POLL:
             return
         self.view_at = time.time()
         try:
@@ -396,7 +398,7 @@ class Panel:
         sid = (a.get("agent_session") or {}).get("value") or (a["pane_id"] if self.kind == "agy" else None)
         if sid != self.session:
             self.session, self.sel, self.top, self.follow, self.current = sid, None, 0, True, None
-            self.pins, self.viewed = self.load_pins(), None
+            self.pins, self.viewed, self.reader, self.gone = self.load_pins(), None, None, set()
         self.load_items()
         if not self.items and time.time() > self.note_until:
             self.say("no turns yet", 5)
@@ -477,11 +479,10 @@ class Panel:
         self.rows_at = {}
         count = sum(1 for x in self.items if x["kind"] == "turn")
         body_lines = []                                   # rendered strings
-        if self.detail is not None:
-            for para in self.detail.splitlines() or [""]:
-                body_lines += [Line().add(w).render(th, cols) for w in (textwrap.wrap(para, cols) or [""])]
-            body_lines = body_lines[:body]
-            hint = Line().add("any key", "text", True).add(" back  ", "overlay0").add("y", "text", True).add(" copy", "overlay0")
+        if self.reader is not None:
+            body_lines = [ln.render(th, cols) for ln in self.reader_frame(cols, body)]
+            hint = (Line().add("← esc", "text", True).add(" back  ", "overlay0").add("↑↓ space", "text", True)
+                    .add(" scroll  ", "overlay0").add("y", "text", True).add(" copy", "overlay0"))
         elif not self.items:
             body_lines = [Line().add(self.note or "", "overlay0").render(th, cols)]
             hint = Line().add("q", "text", True).add(" close", "overlay0")
@@ -533,10 +534,10 @@ class Panel:
                         self.pin_rows[pad + k + 1] = i
                 body_lines.append(ln.render(th, cols, bg))
             body += len(pinned)
-            hint = (Line().add("q", "text", True).add(" close ", "overlay0").add(" ↑↓", "text", True)
-                    .add(" ", "overlay0").add(" ⏎", "text", True).add(" jump ", "overlay0").add(" y", "text", True)
-                    .add(" copy ", "overlay0").add(" p", "text", True).add(" pin ", "overlay0").add(" m", "text", True)
-                    .add(" select" if self.mouse else " click", "overlay0"))
+            hint = Line()                                 # single spaces: six keys fit the panel's 46 columns
+            for k, word in (("q", "close"), ("⏎", "jump"), ("y", "copy"), ("o", "read"), ("p", "pin"),
+                            ("m", "select" if self.mouse else "click")):
+                hint.add(k, "text", True).add(" " + word + " ", "overlay0")
         body_lines += [""] * (body - len(body_lines))
         if self.note and time.time() < self.note_until:
             hint = Line().add(self.note, "text", True)
@@ -598,8 +599,9 @@ class Panel:
             self.say("turn %d is still waiting in the queue" % it["n"])
             return
         compacted = i < self.last_compaction()
-        if compacted and not agents.ADAPTERS[self.kind].keeps_compacted:
-            self.detail = it["text"]
+        if (compacted and not agents.ADAPTERS[self.kind].keeps_compacted) or it["n"] in self.gone:
+            self.open_reader(i)
+            self.say("turn %d is no longer on the agent's screen: here it is" % it["n"], 6)
             return
         if it["n"] == self.viewed:                       # the agent's view is there already: nothing to move
             herdr("agent", "focus", self.target)
@@ -614,12 +616,122 @@ class Panel:
             self.say("at turn %d" % it["n"], 8)
         except (OSError, *{a.error for a in agents.ADAPTERS.values()}) as e:
             if compacted:                               # gone from the agent's screen: read it here instead
-                self.detail = it["text"]
+                self.gone.add(it["n"])
+                self.open_reader(i)
             self.say(str(e)[:200], 8)
 
+    # -- the reader: a whole turn, read from the session file ---------------------------------------
+    def open_reader(self, i):
+        it = self.items[i]
+        if it["kind"] != "turn" or it.get("pending"):
+            self.say("turn %d is still waiting in the queue: no answer yet" % it["n"] if it.get("pending") else "", 4)
+            return
+        self.reader = {"i": i, "n": it["n"], "top": 0, "blocks": None, "sig": None}
+        self.load_reader()
+
+    def load_reader(self):
+        """(Re)read the open turn's answer when it has grown (the newest turn while the agent still writes it)."""
+        r = self.reader
+        it = self.items[r["i"]] if r["i"] < len(self.items) else {}
+        if it.get("n") != r["n"]:                      # the list was read again from the top: find the turn anew
+            r["i"] = next((k for k, x in enumerate(self.items) if x.get("n") == r["n"] and not x.get("pending")), None)
+            if r["i"] is None:
+                self.reader = None
+                return
+            it = self.items[r["i"]]
+        sig = (it.get("words"), it.get("tools"))
+        if sig == r["sig"]:
+            return
+        try:
+            r["blocks"] = agents.ADAPTERS[self.kind].answer(self.session, self.items, r["n"])
+        except (OSError, ValueError, KeyError):
+            r["blocks"] = None
+        r["sig"] = sig
+
+    def reader_lines(self, cols):
+        """The open turn as Lines: the prompt (❯, bold), then the answer: its text lightly formatted (headings bold,
+        code dimmer, list items indented under their bullet) and each tool call as one ⏺ line."""
+        r = self.reader
+        key = ("reader", r["n"], cols, r["sig"])
+        hit = self.line_cache.get(key)
+        if hit is not None:
+            return hit
+        it = self.items[r["i"]]
+        room = max(8, cols - 2)
+        wrap = lambda t, w: textwrap.wrap(t, w, break_long_words=True, replace_whitespace=False) or [""]
+        out = []
+        for para in RELAY.sub(r"\1 › ", it["text"]).splitlines() or [""]:
+            for w in wrap(para, room):
+                out.append(Line().add("❯ " if not out else "  ", "accent", True).add(w, "text", True))
+        out.append(Line())
+        blocks = r["blocks"]
+        if not blocks:
+            out.append(Line().add("no answer in the session file" if blocks is not None else
+                                  "this agent's answers are not readable here", "overlay0"))
+        prev = None
+        for kind, text in blocks or []:
+            if kind == "tool":
+                out.append(Line().add("⏺ ", "overlay0").add(text, "overlay0"))
+                prev = kind
+                continue
+            if prev is not None:
+                out.append(Line())
+            prev, code = kind, False
+            for raw in text.splitlines():
+                if raw.lstrip().startswith("```"):
+                    code = not code
+                    continue
+                if code:
+                    for w in wrap(raw.rstrip(), cols - 2):
+                        out.append(Line().add("  " + w, "subtext0"))
+                    continue
+                line = raw.rstrip().replace("**", "")
+                head = re.match(r"#{1,6}\s+(.*)", line)
+                bullet = re.match(r"(\s*)([-*]|\d+[.)])\s+(.*)", line)
+                if head:
+                    out += [Line().add(w, "text", True) for w in wrap(head.group(1), cols)]
+                elif bullet:
+                    lead = bullet.group(1) + bullet.group(2) + " "
+                    for k, w in enumerate(wrap(bullet.group(3), max(8, cols - len(lead)))):
+                        out.append(Line().add((lead if not k else " " * len(lead)) + w, "subtext0"))
+                else:
+                    out += [Line().add(w, "subtext0") for w in wrap(line, cols)] if line else [Line()]
+        if len(self.line_cache) > 20000:
+            self.line_cache.clear()
+        self.line_cache[key] = out
+        return out
+
+    def reader_frame(self, cols, body):
+        """The reader's rows: a header (← back, the turn's number and size) above the scrolled turn."""
+        self.load_reader()
+        if self.reader is None:
+            return []
+        r, it = self.reader, self.items[self.reader["i"]]
+        lines = self.reader_lines(cols)
+        view = max(1, body - 2)
+        r["top"] = max(0, min(r["top"], len(lines) - view))
+        parts = ([words_text(it["words"])] if it.get("words") else []) \
+            + (["%d tool%s" % (it["tools"], "" if it["tools"] == 1 else "s")] if it.get("tools") else [])
+        head = Line().add("← back", "accent", True).add("   turn %d" % it["n"], "text", True)
+        right = " · ".join(parts)
+        if right and head.width() + cwidth(right) + 2 <= cols:
+            head.add(" " * (cols - head.width() - cwidth(right)), "overlay0").add(right, "overlay0")
+        more = "%d%%" % (100 * min(len(lines), r["top"] + view) // max(1, len(lines))) if len(lines) > view else ""
+        rule = Line().add("─" * max(0, cols - cwidth(more) - (3 if more else 0)), RULE_ROLE)
+        if more:
+            rule.add(" " + more + " ", "overlay0").add("─", RULE_ROLE)
+        return [head, rule] + lines[r["top"]:r["top"] + view]
+
+    def reader_scroll(self, delta=None, to=None):
+        r = self.reader
+        r["top"] = max(0, to if to is not None else r["top"] + delta)    # reader_frame keeps it within the turn
+
     def copy_selected(self, out):
-        text = self.detail if self.detail is not None else (
-            self.items[self.sel]["text"] if self.sel is not None and self.items[self.sel]["kind"] == "turn" else None)
+        if self.reader is not None:
+            r = self.reader
+            text = "\n\n".join([self.items[r["i"]]["text"]] + [t for k, t in r["blocks"] or [] if k == "text"])
+        else:
+            text = self.items[self.sel]["text"] if self.sel is not None and self.items[self.sel]["kind"] == "turn" else None
         if text is None:
             return
         self.say("copied to the " + copy_text(text, out), 3)
@@ -640,12 +752,16 @@ def read_keys(fd):
                 elif data[j:j + 1] == "M" and 32 <= b < 64 and b & 3 == 3:     # motion with no button held
                     keys.append(("move", (y, x)))
                 elif b == 64:
-                    keys.append(("up", None))
+                    keys.append(("up", "wheel"))
                 elif b == 65:
-                    keys.append(("down", None))
+                    keys.append(("down", "wheel"))
             except ValueError:
                 pass
             i = j + 1
+        elif data.startswith("\x1b[D", i):
+            keys.append(("left", None)); i += 3
+        elif data.startswith("\x1b[C", i):
+            keys.append(("right", None)); i += 3
         elif data.startswith("\x1b[A", i):
             keys.append(("up", None)); i += 3
         elif data.startswith("\x1b[B", i):
@@ -681,11 +797,23 @@ def run():
             ready, _, _ = select.select([fd], [], [], POLL)
             if ready:
                 for kind, val in read_keys(fd):
-                    if p.detail is not None:
+                    if p.reader is not None:
+                        page = shutil.get_terminal_size((40, 24)).lines - 7
                         if kind == "char" and val in ("y", "Y"):
                             p.copy_selected(out)
-                        else:
-                            p.detail = None
+                        elif kind == "left" or (kind == "char" and val in ("\x1b", "q", "Q", "h", "o", "\x7f", "\x08")) \
+                                or (kind == "click" and val[0] == 1 and val[1] <= len("← back")):
+                            p.reader = None
+                        elif kind in ("up", "down"):
+                            p.reader_scroll((3 if val == "wheel" else 1) * (-1 if kind == "up" else 1))
+                        elif kind == "char" and val in ("k", "j"):
+                            p.reader_scroll(-1 if val == "k" else 1)
+                        elif kind == "pgup" or (kind == "char" and val == "b"):
+                            p.reader_scroll(-page)
+                        elif kind == "pgdn" or (kind == "char" and val == " "):
+                            p.reader_scroll(page)
+                        elif kind == "char" and val in ("g", "G"):
+                            p.reader_scroll(to=0 if val == "g" else 10 ** 9)
                     elif kind == "char" and val in ("q", "Q"):
                         return 0
                     elif kind == "up" or (kind == "char" and val == "k"):
@@ -714,6 +842,8 @@ def run():
                             pass
                     elif kind == "char" and val in ("p", "P"):
                         p.toggle_pin(p.sel)
+                    elif kind == "char" and val in ("o", "O") and p.sel is not None:
+                        p.open_reader(p.sel)
                     elif kind == "move":
                         p.hover, p.hover_at = p.rows_at.get(val[0]), time.time()
                         p.pin_hover = p.pin_hit(*val)

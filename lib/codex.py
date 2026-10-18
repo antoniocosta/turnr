@@ -10,6 +10,7 @@ import json
 import os
 
 import nav
+import turns
 
 JumpError = nav.JumpError
 KEEPS_COMPACTED = True      # attempt turns above a compaction; the navigator says so if they are not on screen
@@ -43,7 +44,7 @@ def load(path):
         return _memo["items"]
     items, cur = [], None
     with open(path, "rb") as f:
-        for raw in f:
+        for lineno, raw in enumerate(f):
             try:
                 rec = json.loads(raw)
             except ValueError:
@@ -52,11 +53,11 @@ def load(path):
             if not isinstance(p, dict):
                 continue
             if kind == "compacted":
-                items.append({"kind": "compaction", "auto": True, "time": rec.get("timestamp")})
+                items.append({"kind": "compaction", "auto": True, "time": rec.get("timestamp"), "line": lineno})
             elif kind == "event_msg" and p.get("type") == "item_completed" and (p.get("item") or {}).get("type") == "UserMessage":
                 text = _text(p["item"].get("content")).strip()
                 if text and not text.startswith("/"):
-                    cur = {"kind": "turn", "text": text, "time": rec.get("timestamp")}
+                    cur = {"kind": "turn", "text": text, "time": rec.get("timestamp"), "line": lineno}
                     items.append(cur)
             elif kind == "response_item" and cur is not None:
                 if p.get("type") in _TOOL_CALLS:
@@ -72,6 +73,38 @@ def load(path):
             it["n"], it["compactions_above"] = n, comp
     _memo.update(key=key, items=items)
     return items
+
+
+def answer(path, n):
+    """Turn n's answer: [("text", markdown) | ("tool", one line)] (see turns.read_answer)."""
+    items = load(path)
+    at = next((k for k, it in enumerate(items) if it.get("n") == n), None)
+    if at is None:
+        return []
+    start = items[at]["line"]
+    end = next((it["line"] for it in items[at + 1:]), None)
+    out = []
+    with open(path, "rb") as f:
+        for lineno, raw in enumerate(f):
+            if lineno <= start:
+                continue
+            if end is not None and lineno >= end:
+                break
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            p = rec.get("payload") or {}
+            if rec.get("type") != "response_item" or not isinstance(p, dict):
+                continue
+            if p.get("type") == "message" and p.get("role") == "assistant" and _text(p.get("content")).strip():
+                out.append(("text", _text(p.get("content")).strip()))
+            elif p.get("type") == "local_shell_call":
+                out.append(("tool", turns.tool_line("shell", (p.get("action") or {}).get("command"))))
+            elif p.get("type") in _TOOL_CALLS:
+                out.append(("tool", turns.tool_line(p.get("name") or p["type"].replace("_call", ""),
+                                                    p.get("arguments") or p.get("input") or p.get("action"))))
+    return out
 
 
 def load_session(pane, session):

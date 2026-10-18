@@ -35,6 +35,15 @@ class Load(unittest.TestCase):
         self.assertEqual([i["kind"] for i in items], ["turn", "turn", "compaction"])
         self.assertEqual((items[0]["tools"], items[0]["words"]), (1, 3))
 
+    def test_a_turns_answer_is_read_from_the_file(self):
+        call = {"type": "response_item", "payload": {"type": "function_call", "name": "shell",
+                                                     "arguments": '{"command": ["git", "log"]}'}}
+        answer = {"type": "response_item", "payload": {"type": "message", "role": "assistant",
+                                                       "content": [{"type": "output_text", "text": "Two commits."}]}}
+        p = rollout([typed("first"), call, answer, typed("second")])
+        self.assertEqual(codex.answer(p, 1), [("tool", "shell  git log"), ("text", "Two commits.")])
+        self.assertEqual(codex.answer(p, 2), [])
+
     def test_slash_commands_are_not_turns(self):
         self.assertEqual(len(codex.load(rollout([typed("/model"), typed("real")]))), 1)
 

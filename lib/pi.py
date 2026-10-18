@@ -10,6 +10,7 @@ import json
 import os
 
 import nav
+import turns
 
 JumpError = nav.JumpError
 KEEPS_COMPACTED = True      # turns before the last compaction can still be jumped to
@@ -24,13 +25,13 @@ def load(path):
         return _memo["items"]
     items, cur = [], None
     with open(path, "rb") as f:
-        for raw in f:
+        for lineno, raw in enumerate(f):
             try:
                 rec = json.loads(raw)
             except ValueError:
                 continue
             if rec.get("type") == "compaction":
-                items.append({"kind": "compaction", "auto": True, "time": rec.get("timestamp")})
+                items.append({"kind": "compaction", "auto": True, "time": rec.get("timestamp"), "line": lineno})
                 continue
             m = rec.get("message") or {}
             role = m.get("role")
@@ -40,7 +41,7 @@ def load(path):
                     b.get("text", "") for b in (blocks or []) if isinstance(b, dict) and b.get("type") == "text")
                 text = text.strip()
                 if text and not text.startswith("/"):
-                    cur = {"kind": "turn", "text": text, "time": rec.get("timestamp")}
+                    cur = {"kind": "turn", "text": text, "time": rec.get("timestamp"), "line": lineno}
                     items.append(cur)
             elif role == "assistant" and cur is not None and isinstance(blocks, list):
                 for b in blocks:
@@ -57,6 +58,35 @@ def load(path):
             it["n"], it["compactions_above"] = n, comp
     _memo.update(key=key, items=items)
     return items
+
+
+def answer(path, n):
+    """Turn n's answer: [("text", markdown) | ("tool", one line)] (see turns.read_answer)."""
+    items = load(path)
+    at = next((k for k, it in enumerate(items) if it.get("n") == n), None)
+    if at is None:
+        return []
+    start = items[at]["line"]
+    end = next((it["line"] for it in items[at + 1:]), None)
+    out = []
+    with open(path, "rb") as f:
+        for lineno, raw in enumerate(f):
+            if lineno <= start:
+                continue
+            if end is not None and lineno >= end:
+                break
+            try:
+                m = json.loads(raw).get("message") or {}
+            except (ValueError, AttributeError):
+                continue
+            if m.get("role") != "assistant" or not isinstance(m.get("content"), list):
+                continue
+            for b in m["content"]:
+                if b.get("type") == "text" and (b.get("text") or "").strip():
+                    out.append(("text", b["text"].strip()))
+                elif b.get("type") == "toolCall":
+                    out.append(("tool", turns.tool_line(b.get("name"), b.get("arguments"))))
+    return out
 
 
 # ── the pane ─────────────────────────────────────────────────────────────────────────────────────

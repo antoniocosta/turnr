@@ -149,6 +149,54 @@ def read_items(path, offset=0, lineno=0, pending=None, last=None):
     return items, offset, lineno, pending
 
 
+# What a tool call is about, for its one-line summary in the reader: the first of these its input has.
+_TOOL_KEYS = ("command", "cmd", "file_path", "path", "notebook_path", "pattern", "url", "query", "description", "prompt")
+
+
+def tool_line(name, args):
+    """A tool call as one line: its name and what it was called on ("Bash  grep -n x lib")."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            args = {"command": args}
+    if isinstance(args, list):
+        args = {"command": args}
+    what = ""
+    if isinstance(args, dict):
+        v = next((args[k] for k in _TOOL_KEYS if args.get(k)), "")
+        what = " ".join(map(str, v)) if isinstance(v, list) else str(v)
+    return ((name or "tool") + "  " + re.sub(r"\s+", " ", what).strip()).strip()
+
+
+def read_answer(path, start, end=None):
+    """The answer to the turn whose prompt record starts at byte `start`, up to byte `end` (the next turn's, or the
+    end of the file): [("text", markdown) | ("tool", one line)], in order. Thinking and tool results are left out."""
+    out = []
+    with open(path, "rb") as f:
+        f.seek(start)
+        f.readline()                                    # the prompt's own record
+        pos = f.tell()
+        for rawb in f:
+            pos += len(rawb)
+            if end is not None and pos > end:
+                break
+            try:
+                rec = json.loads(rawb)
+            except ValueError:
+                continue
+            if rec.get("type") != "assistant" or rec.get("isSidechain"):
+                continue
+            for b in (rec.get("message") or {}).get("content") or []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text" and (b.get("text") or "").strip():
+                    out.append(("text", b["text"].strip()))
+                elif b.get("type") == "tool_use":
+                    out.append(("tool", tool_line(b.get("name"), b.get("input"))))
+    return out
+
+
 def number(items, pending=()):
     """Give each turn its 1-based number and say how many compactions lie above it. Prompts the agent has not
     taken yet go last, as turns marked pending."""
