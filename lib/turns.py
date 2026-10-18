@@ -52,6 +52,14 @@ def _text_of(message):
     return ""
 
 
+# Claude Code stores pasted text wrapped in these tags; its screen shows only what is inside.
+_PASTE_TAG = re.compile(r"</?pasted_content(?:\s[^>]*)?>")
+
+
+def _unwrap(text):
+    return _PASTE_TAG.sub("", text).strip()
+
+
 def _first_line(text, width):
     line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
     line = re.sub(r"\s+", " ", line)
@@ -128,7 +136,7 @@ def read_items(path, offset=0, lineno=0, pending=None, last=None):
                 text = text.strip()
                 if not text or text.startswith(_NOT_PROMPT_PREFIXES) or text.startswith("/"):
                     continue
-                cur = {"kind": "turn", "line": lineno, "byte": start, "time": rec.get("timestamp"), "text": text, "queued": True}
+                cur = {"kind": "turn", "line": lineno, "byte": start, "time": rec.get("timestamp"), "text": _unwrap(text), "queued": True}
                 items.append(cur)
                 continue
             if kind != "user" or rec.get("isMeta") or rec.get("isCompactSummary"):
@@ -136,7 +144,7 @@ def read_items(path, offset=0, lineno=0, pending=None, last=None):
             text = _text_of(rec.get("message") or {}).strip()
             if not text or text.startswith(_NOT_PROMPT_PREFIXES) or text.startswith("/"):
                 continue
-            cur = {"kind": "turn", "line": lineno, "byte": start, "time": rec.get("timestamp"), "text": text}
+            cur = {"kind": "turn", "line": lineno, "byte": start, "time": rec.get("timestamp"), "text": _unwrap(text)}
             items.append(cur)
     return items, offset, lineno, pending
 
@@ -144,7 +152,7 @@ def read_items(path, offset=0, lineno=0, pending=None, last=None):
 def number(items, pending=()):
     """Give each turn its 1-based number and say how many compactions lie above it. Prompts the agent has not
     taken yet go last, as turns marked pending."""
-    items = list(items) + [{"kind": "turn", "line": q["line"], "time": q["time"], "text": q["text"],
+    items = list(items) + [{"kind": "turn", "line": q["line"], "time": q["time"], "text": _unwrap(q["text"]),
                             "queued": True, "pending": True} for q in pending]
     n, comp = 0, 0
     for it in items:
@@ -176,12 +184,12 @@ def load_cached(path):
     try:
         with open(cache) as f:
             state = json.load(f)
-        if state["size"] > st.st_size or state["ino"] != st.st_ino or state["version"] != 4:
+        if state["size"] > st.st_size or state["ino"] != st.st_ino or state["version"] != 5:
             state = None
     except (OSError, ValueError, KeyError):
         state = None
     if state is None:
-        state = {"version": 4, "ino": st.st_ino, "size": 0, "offset": 0, "lineno": 0, "items": [], "pending": []}
+        state = {"version": 5, "ino": st.st_ino, "size": 0, "offset": 0, "lineno": 0, "items": [], "pending": []}
     if st.st_size > state["offset"]:
         last = next((x for x in reversed(state["items"]) if x["kind"] == "turn"), None)
         new, state["offset"], state["lineno"], state["pending"] = read_items(

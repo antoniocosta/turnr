@@ -68,6 +68,11 @@ class ReadItems(unittest.TestCase):
         side["isSidechain"] = True
         self.assertEqual(len(turns.load(write([user("a"), side]))), 1)
 
+    def test_pasted_text_loses_its_wrapper(self):
+        p = write([user('<pasted_content id="ab12">\nFailed to load resource: 401\n</pasted_content id="ab12">'),
+                   user('see <pasted_content id="cd34">\nx = 1\n</pasted_content id="cd34"> and fix it')])
+        self.assertEqual([i["text"] for i in turns.load(p)], ["Failed to load resource: 401", "see \nx = 1\n and fix it"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,8 @@
 
 Each turn sits under a rule that carries its number (── 98 ────). Keys: j/k or arrows move, PgUp/PgDn page,
 g/G first/last, Enter or a click jumps the agent's pane to that turn (turns above the last compaction open as
-text here instead), y copies the turn's text, m switches the mouse to selecting text and back, q closes.
+text here instead), y copies the turn's text, p pins it (or a click on its ⌕), m switches the mouse to selecting
+text and back, q closes. Pinned turns stay in a block above the status lines, remembered per session.
 Colours come from herdr's theme (lib/herdr_style.py).
 """
 import base64
@@ -34,6 +35,8 @@ PLUGIN = "turnr"
 HOVER_SECONDS = float(os.environ.get("TURNR_HOVER_SECONDS", "1.2"))   # no "mouse left" event exists: fade when it stops moving
 POLL = 0.4              # how often the file is looked at (cheap: it reads only new lines)
 TARGET_POLL = 1.5       # how often herdr is asked which agent is next to the panel
+VIEW_POLL = 0.5         # how often the agent's screen is read for the turn its view is at (no keys sent)
+RELAY = re.compile(r"^\[From ([^\]()]+?)\s*(?:\([^)]*\))?\s+via herdr\]\s*")   # "[From Stash (~/dev/Stash) via herdr] "
 MOUSE_ON = "\x1b[?1000h\x1b[?1003h\x1b[?1006h"
 MOUSE_OFF = "\x1b[?1003l\x1b[?1000l\x1b[?1006l"
 RESET = "\x1b[0m"
@@ -228,6 +231,14 @@ def ui_file():
     return os.path.join(turns._state_dir(), "ui.json")
 
 
+def pins_file():
+    return os.path.join(turns._state_dir(), "pins.json")
+
+
+PIN_ICON, PINNED_ICON = "⌕", "⚲"
+PIN_ROLE = "accent"
+
+
 class Panel:
     def __init__(self):
         self.me = os.environ.get("HERDR_PANE_ID")
@@ -251,6 +262,11 @@ class Panel:
         self.hover = None
         self.hover_at = 0.0
         self.line_cache = {}
+        self.viewed = None          # the turn number the agent's view was last read to be at
+        self.view_at = 0.0
+        self.pins = []              # the pinned turns' numbers, in the order they were pinned (the last is lowest)
+        self.pin_hover = None       # the item whose pin icon the mouse is on
+        self.pin_rows = {}          # screen row of a turn's rule → item index (where its pin icon is)
         try:
             self.mouse = bool(json.load(open(ui_file())).get("mouse", True))
         except (OSError, ValueError):
@@ -270,7 +286,7 @@ class Panel:
             return
         self.load_items()
         if self.follow:
-            self.sel = len(self.items) - 1 if self.items else None
+            self.sel = self.last_main()
 
     def load_items(self):
         try:
@@ -278,8 +294,96 @@ class Panel:
         except OSError:
             pass
 
+    def sync_view(self):
+        """Follow the agent's view: when it has scrolled to another turn, highlight that turn and bring it into the
+        list. Only reads the agent's screen."""
+        if not self.target or self.detail is not None or time.time() - self.view_at < VIEW_POLL:
+            return
+        self.view_at = time.time()
+        try:
+            n = agents.ADAPTERS[self.kind].view(self.target, self.items, self.viewed)
+        except (OSError, ValueError, KeyError):
+            return
+        if n is None or n == self.viewed:
+            return
+        i = next((k for k, it in enumerate(self.items) if it["kind"] == "turn" and it.get("n") == n
+                  and not it.get("pending")), None)
+        if i is None:
+            return
+        self.viewed = n
+        self.current = None if i == self.newest_turn() else i
+        self.sel, self.follow = i, i == self.last_main()
+
     def newest_turn(self):
         return max((i for i, it in enumerate(self.items) if it["kind"] == "turn" and not it.get("pending")), default=None)
+
+    # -- pins ---------------------------------------------------------------------------------------
+    def load_pins(self):
+        try:
+            return [int(n) for n in json.load(open(pins_file())).get(self.session or "", [])]
+        except (OSError, ValueError, TypeError, AttributeError):
+            return []
+
+    def save_pins(self):
+        if not self.session:
+            return
+        try:
+            saved = json.load(open(pins_file()))
+            saved = saved if isinstance(saved, dict) else {}
+        except (OSError, ValueError):
+            saved = {}
+        if self.pins:
+            saved[self.session] = self.pins
+        else:
+            saved.pop(self.session, None)
+        try:
+            json.dump(saved, open(pins_file(), "w"))
+        except OSError:
+            pass
+
+    @staticmethod
+    def pinnable(it):
+        return it["kind"] == "turn" and not it.get("pending")     # a queued prompt has no number of its own yet
+
+    def pinned_items(self):
+        """The pinned turns as item indices, in pin order (a pin whose turn is not listed is skipped)."""
+        at = {it["n"]: i for i, it in enumerate(self.items) if self.pinnable(it)}
+        return [at[n] for n in self.pins if n in at]
+
+    def order(self):
+        """Item indices in the order they are drawn: the list without the pinned turns, then the pinned ones."""
+        pinned = self.pinned_items()
+        skip = set(pinned)
+        return [i for i in range(len(self.items)) if i not in skip] + pinned, len(self.items) - len(pinned)
+
+    def last_main(self):
+        order, main = self.order()
+        return order[main - 1] if main else (order[-1] if order else None)
+
+    def toggle_pin(self, i):
+        if i is None or i >= len(self.items) or not self.pinnable(self.items[i]):
+            return
+        n = self.items[i]["n"]
+        if n in self.pins:
+            self.pins.remove(n)
+            self.say("turn %d unpinned" % n, 3)
+        else:
+            self.pins.append(n)
+            self.say("turn %d pinned" % n, 3)
+        self.pin_hover = None
+        self.save_pins()
+
+    def pin_hit(self, row, x):
+        """The item whose pin icon (with its "pin" word), or "unpin" word, is at this screen cell, or None."""
+        i = self.pin_rows.get(row)
+        if i is None:
+            return None
+        it = self.items[i]
+        x0 = len(str(it["n"])) + 4                    # ─, space, the number, space: the icon is the next column
+        if it["n"] in self.pins:
+            return i if x0 <= x < x0 + len("unpin") else None
+        word = " pin" if self.pin_hover == i else ""
+        return i if x0 <= x <= x0 + len(word) else None
 
     def refresh(self):
         a = self.find_target()
@@ -292,11 +396,12 @@ class Panel:
         sid = (a.get("agent_session") or {}).get("value") or (a["pane_id"] if self.kind == "agy" else None)
         if sid != self.session:
             self.session, self.sel, self.top, self.follow, self.current = sid, None, 0, True, None
+            self.pins, self.viewed = self.load_pins(), None
         self.load_items()
         if not self.items and time.time() > self.note_until:
             self.say("no turns yet", 5)
         if self.follow:
-            self.sel = len(self.items) - 1 if self.items else None
+            self.sel = self.last_main()
 
     # -- drawing ------------------------------------------------------------------------------------
     def last_compaction(self):
@@ -308,7 +413,8 @@ class Panel:
         navigate-mode cursor row). Colours follow herdr's sidebar. Cached: only the items whose state changes
         are drawn again."""
         it = self.items[i]
-        key = (i, cols, i < cut, state, it.get("pending"), it.get("n"), len(it.get("text", "")), it["kind"], it.get("words"), it.get("tools"))
+        pin = None if not self.pinnable(it) else ("unpin" if it["n"] in self.pins else ("pin" if self.pin_hover == i else ""))
+        key = (i, cols, i < cut, state, pin, it.get("pending"), it.get("n"), len(it.get("text", "")), it["kind"], it.get("words"), it.get("tools"))
         hit = self.line_cache.get(key)
         if hit is not None:
             return hit
@@ -324,6 +430,13 @@ class Panel:
             # cursor, overlay0 otherwise; secondary text is overlay0 (mauve on the active row)
             num_c = "yellow" if it.get("pending") else ("text" if sel else ("overlay1" if state == "hover" else "overlay0"))
             rule = Line().add("─", rule_c).add(label, num_c)
+            if pin is not None:                          # ⌕ after the number; hovered "⚲ pin"; pinned "unpin"
+                if pin == "unpin":
+                    rule.add(pin, PIN_ROLE, True).add(" ", rule_c)
+                elif pin:
+                    rule.add(PINNED_ICON + " " + pin, PIN_ROLE, True).add(" ", rule_c)
+                else:
+                    rule.add(PIN_ICON, num_c).add(" ", rule_c)
             parts = ([words_text(it["words"])] if it.get("words") else []) \
                 + (["%d tool%s" % (it["tools"], "" if it["tools"] == 1 else "s")] if it.get("tools") else [])
             # the stats sit at the right end of the rule: ─ 226 ───── 1.8k words · 164 tools ─
@@ -339,7 +452,7 @@ class Panel:
             # the name: text, bold, on the active row; subtext0 on the others (herdr: workspace_style); the turns
             # the model only knows through a summary are secondary text
             role = "text" if sel else ("subtext0" if i >= cut else "overlay0")
-            text = re.sub(r"\s+", " ", it["text"]).strip()
+            text = RELAY.sub(r"\1 › ", re.sub(r"\s+", " ", it["text"]).strip())   # a relayed prompt: its sender, short
             room = max(8, cols - 1)
             wrapped = textwrap.wrap(text[: room * 3], room, break_long_words=True) or [""]
             if len(wrapped) > 2 or len(text) > room * 2:
@@ -350,6 +463,11 @@ class Panel:
             self.line_cache.clear()
         self.line_cache[key] = lines
         return lines
+
+    def pins_divider(self, cols):
+        # its dashes as bright as the turnr rule under the list (overlay0), not the faint rule between turns
+        ln = Line().add("── ", "overlay0").add(PINNED_ICON + " pinned", PIN_ROLE, True).add(" ", "overlay0")
+        return ln.add("─" * max(0, cols - ln.width()), "overlay0")
 
     def frame(self):
         self.theme.load()
@@ -371,8 +489,18 @@ class Panel:
             cut = self.last_compaction()
             here = self.current if self.current is not None else self.newest_turn()
             state_of = lambda i: "sel" if i == here else ("hover" if i in (self.sel, self.hover) else None)
+            order, nmain = self.order()
+            self.pin_rows = {}
+            # the pinned block: a divider, then the pinned turns, newest pin lowest; at most two thirds of the body
+            # (the latest pins show when there are more)
+            pinned = []                                   # (line, item, whether it is the item's rule)
+            for i in order[nmain:]:
+                pinned += [(ln, i, k == 0) for k, ln in enumerate(self.item_lines(i, cols, cut, state_of(i)))]
+            if pinned:
+                pinned = ([(self.pins_divider(cols), None, False)] + pinned)[-(body * 2 // 3):] if body >= 2 else []
+            body -= len(pinned)
             flat, owner, first_of = [], [], {}            # every line of every item, whose it is, where each starts
-            for i in range(len(self.items)):
+            for i in order[:nmain]:
                 lines = self.item_lines(i, cols, cut, state_of(i))
                 first_of[i] = len(flat)
                 flat += lines
@@ -380,6 +508,8 @@ class Panel:
             total = len(flat)
             if self.follow or self.sel is None:
                 top = max(0, total - body)
+            elif self.sel not in first_of:                # the cursor is in the pinned block: the list stays put
+                top = max(0, min(self.top, max(0, total - body)))
             else:
                 top = self.top
                 a = first_of[self.sel]
@@ -390,18 +520,22 @@ class Panel:
             window = range(top, min(total, top + body))
             pad = body - len(window)                      # a short list sits at the bottom: no gap above the status
             body_lines = [""] * pad
-            for k, ln in enumerate(window):
-                i = owner[ln]
+            rows = [(flat[ln], owner[ln], ln == first_of[owner[ln]]) for ln in window]
+            rows += pinned
+            for k, (ln, i, first) in enumerate(rows):
                 bg = None
-                if self.items[i]["kind"] == "turn":
+                if i is not None and self.items[i]["kind"] == "turn":
                     st = state_of(i)
                     # herdr's own roles: the active row (where the agent is) and the Navigate-mode cursor row
                     bg = "active_row_bg" if st == "sel" else ("selection_bg" if st == "hover" else None)
                     self.rows_at[pad + k + 1] = i
-                body_lines.append(flat[ln].render(th, cols, bg))
+                    if first and self.pinnable(self.items[i]):
+                        self.pin_rows[pad + k + 1] = i
+                body_lines.append(ln.render(th, cols, bg))
+            body += len(pinned)
             hint = (Line().add("q", "text", True).add(" close ", "overlay0").add(" ↑↓", "text", True)
                     .add(" ", "overlay0").add(" ⏎", "text", True).add(" jump ", "overlay0").add(" y", "text", True)
-                    .add(" copy ", "overlay0").add(" m", "text", True)
+                    .add(" copy ", "overlay0").add(" p", "text", True).add(" pin ", "overlay0").add(" m", "text", True)
                     .add(" select" if self.mouse else " click", "overlay0"))
         body_lines += [""] * (body - len(body_lines))
         if self.note and time.time() < self.note_until:
@@ -443,15 +577,16 @@ class Panel:
         if not self.items:
             return
         self.follow = False
-        cur = self.sel if self.sel is not None else len(self.items) - 1
+        order, _ = self.order()                               # in drawn order: the pinned turns come last
+        cur = order.index(self.sel) if self.sel in order else len(order) - 1
         cur = to if to is not None else cur + delta
-        self.sel = max(0, min(len(self.items) - 1, cur))
-        if self.items[self.sel]["kind"] == "compaction":      # land on turns, not on dividers
+        cur = max(0, min(len(order) - 1, cur))
+        if self.items[order[cur]]["kind"] == "compaction":    # land on turns, not on dividers
             step = 1 if (delta or 1) > 0 else -1
-            nxt = self.sel + step
-            if 0 <= nxt < len(self.items):
-                self.sel = nxt
-        if self.sel == len(self.items) - 1:
+            if 0 <= cur + step < len(order):
+                cur += step
+        self.sel = order[cur]
+        if self.sel == self.last_main():
             self.follow = True
 
     def activate(self, i=None):
@@ -462,17 +597,24 @@ class Panel:
         if it.get("pending"):
             self.say("turn %d is still waiting in the queue" % it["n"])
             return
-        if i < self.last_compaction() and not agents.ADAPTERS[self.kind].keeps_compacted:
+        compacted = i < self.last_compaction()
+        if compacted and not agents.ADAPTERS[self.kind].keeps_compacted:
             self.detail = it["text"]
+            return
+        if it["n"] == self.viewed:                       # the agent's view is there already: nothing to move
+            herdr("agent", "focus", self.target)
+            self.say("at turn %d" % it["n"], 4)
             return
         self.say("jumping to turn %d…" % it["n"], 30)
         self.draw(sys.stdout)
         try:
             agents.ADAPTERS[self.kind].jump(self.target, it["n"], self.session)
             herdr("agent", "focus", self.target)
-            self.current = None if i == self.newest_turn() else i
+            self.current, self.viewed = (None if i == self.newest_turn() else i), it["n"]
             self.say("at turn %d" % it["n"], 8)
         except (OSError, *{a.error for a in agents.ADAPTERS.values()}) as e:
+            if compacted:                               # gone from the agent's screen: read it here instead
+                self.detail = it["text"]
             self.say(str(e)[:200], 8)
 
     def copy_selected(self, out):
@@ -494,9 +636,9 @@ def read_keys(fd):
             try:
                 b, x, y = (int(v) for v in data[i + 3:j].split(";"))
                 if data[j:j + 1] == "M" and b == 0:
-                    keys.append(("click", y))
+                    keys.append(("click", (y, x)))
                 elif data[j:j + 1] == "M" and 32 <= b < 64 and b & 3 == 3:     # motion with no button held
-                    keys.append(("move", y))
+                    keys.append(("move", (y, x)))
                 elif b == 64:
                     keys.append(("up", None))
                 elif b == 65:
@@ -570,20 +712,26 @@ def run():
                             json.dump({"mouse": p.mouse}, open(ui_file(), "w"))
                         except OSError:
                             pass
+                    elif kind == "char" and val in ("p", "P"):
+                        p.toggle_pin(p.sel)
                     elif kind == "move":
-                        p.hover, p.hover_at = p.rows_at.get(val), time.time()
+                        p.hover, p.hover_at = p.rows_at.get(val[0]), time.time()
+                        p.pin_hover = p.pin_hit(*val)
                     elif kind == "click":
-                        i = p.rows_at.get(val)
-                        if i is not None and p.items[i]["kind"] == "turn":
+                        i = p.rows_at.get(val[0])
+                        if p.pin_hit(*val) is not None:
+                            p.toggle_pin(p.pin_hit(*val))
+                        elif i is not None and p.items[i]["kind"] == "turn":
                             p.sel, p.follow = i, False
                             p.activate(i)
             if p.hover is not None and time.time() - p.hover_at > HOVER_SECONDS:
-                p.hover = None
+                p.hover = p.pin_hover = None
             if time.time() - last >= TARGET_POLL:
                 last = time.time()
                 p.refresh()
             else:
                 p.reload_items()
+            p.sync_view()
             p.draw(out)
     finally:
         out.write(MOUSE_OFF + "\x1b[?25h\x1b[?1049l")

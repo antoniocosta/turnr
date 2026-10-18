@@ -2,6 +2,7 @@
 
     load(pane, session) -> (items, size)   the numbered turns, and the size in bytes of what they came from (0: n/a)
     jump(pane, n, session) -> dict         scroll the pane to turn n, or raise JumpError
+    view(pane, items, prev) -> n or None   the turn the pane's view is at, read off its screen (no keys sent)
 
 `session` is what herdr reports for the pane (an id for Claude Code, Codex; a file path for pi; none for agy).
 `keeps_compacted`: whether turns before the last compaction may still be on the agent's screen, so a jump is tried.
@@ -12,13 +13,15 @@ import os
 import agy
 import codex
 import jump as claude_jump
+import nav
 import pi
 import turns
 
 
 class Adapter:
-    def __init__(self, name, load, jump, keeps_compacted, error):
+    def __init__(self, name, load, jump, keeps_compacted, error, view=lambda pane, items, prev: None):
         self.name, self.load, self.jump, self.keeps_compacted, self.error = name, load, jump, keeps_compacted, error
+        self.view = view
 
 
 def _claude_load(pane, session):
@@ -35,8 +38,10 @@ def _agy_load(pane, session):
 
 
 ADAPTERS = {
-    "claude": Adapter("claude", _claude_load, _claude_jump, False, claude_jump.JumpError),
-    "pi": Adapter("pi", pi.load_session, pi.jump, True, pi.JumpError),
-    "codex": Adapter("codex", codex.load_session, codex.jump, True, codex.JumpError),
+    "claude": Adapter("claude", _claude_load, _claude_jump, True, claude_jump.JumpError, claude_jump.in_view),
+    "pi": Adapter("pi", pi.load_session, pi.jump, True, pi.JumpError,
+                  lambda pane, items, prev: nav.in_view(pane, items, "", prev)),
+    "codex": Adapter("codex", codex.load_session, codex.jump, True, codex.JumpError,
+                     lambda pane, items, prev: nav.in_view(pane, items, codex.MARKER, prev)),
     "agy": Adapter("agy", _agy_load, lambda pane, n, session: agy.jump(pane, n), True, agy.JumpError),
 }

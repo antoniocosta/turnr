@@ -2,8 +2,9 @@
 
 Claude Code runs fullscreen (alternate screen), so herdr has no scrollback to move. Instead the pane gets
 Claude's own scroll keys (PgUp/PgDn, Ctrl+End) in batches, and a click on the pinned prompt header, which
-jumps to that prompt. Claude only shows the turns after the last compaction, so earlier ones cannot be
-jumped to.
+jumps to that prompt. Where the view is comes only from the prompts on screen: they are drawn in turn order
+(those before a compaction too), but the pinned header is not always the nearest one, since a prompt typed
+while Claude was working never becomes the header, and prompts can share their text ("A", "yes").
 
 Safety: keys go to the pane only while herdr reports an agent there that is idle or working.
 Never when it is blocked (a dialog would take the keys), absent (they would land in a shell), or unknown.
@@ -82,15 +83,18 @@ def _norm(s):
 
 
 def segment(items):
-    """The turns Claude can show: those after the last compaction."""
-    last = max((i for i, it in enumerate(items) if it["kind"] == "compaction"), default=-1)
-    return [it for it in items[last + 1:] if it["kind"] == "turn" and not it.get("pending")]
+    """The turns that can be on Claude's screen: every one it has taken (it keeps those above a compaction too)."""
+    return [it for it in items if it["kind"] == "turn" and not it.get("pending")]
 
 
-def _matches(on_screen, turn):
-    want = _norm(turn["text"].splitlines()[0] if turn["text"].strip() else "")
-    k = min(len(want), len(on_screen), 40)
-    return k > 0 and on_screen[:k] == want[:k]
+def _matches(shown, head):
+    """Whether a '❯ ' line shows the prompt `head` (its text, lines joined): the line is the whole prompt, or its start
+    cut with "…", or its start wrapped at a space. A bare "A" is not "Also, …"; a line half covered by Claude's
+    "Jump to bottom" hint matches nothing."""
+    if shown.endswith("…"):
+        s = shown[:-1].rstrip()
+        return bool(s) and head.startswith(s)
+    return bool(shown) and (head == shown or head.startswith(shown + " "))
 
 
 def leave(pane):
@@ -110,19 +114,6 @@ def _raw(pane, text):
         raise JumpError("send-text failed: %s" % out.strip()[:200])
 
 
-def read_position(pane, seg):
-    """(header, visible): `header` is the turn index shown on the first screen row when it is a '❯ prompt' line.
-    Scrolled up, Claude pins there the prompt of the turn whose answer the window is inside. `visible` is every
-    prompt on screen (turn indexes)."""
-    lines = screen(pane).splitlines()
-    def idx_of(line):
-        text = _norm(line[2:])
-        return next((i for i, t in enumerate(seg) if _matches(text, t)), None)
-    header = idx_of(lines[0]) if lines and lines[0].startswith("❯ ") else None
-    visible = sorted({i for i in (idx_of(l) for l in lines if l.startswith("❯ ")) if i is not None})
-    return header, visible
-
-
 def _click_top_row(pane):
     _raw(pane, "\x1b[<0;10;1M\x1b[<0;10;1m")     # a left click on row 1: Claude jumps to the pinned prompt
 
@@ -139,27 +130,6 @@ def settle(pane, first=0.05, limit=1.5):
         time.sleep(0.04)
 
 
-HOP_RANGE = 4        # within this many turns above the target, hop with header clicks instead of paging
-
-
-def align_to_top(pane, seg, t):
-    """Turn t's prompt is on screen but not on the top row. Scroll down a page at a time until it slips under the
-    top, where Claude pins it as the header, then click the header: the real prompt comes to the top. If the page
-    steps overshoot (a very short answer), go back up and leave it on screen. → True when it is at the top."""
-    for _ in range(8):
-        header, visible = read_position(pane, seg)
-        if header == t:
-            _click_top_row(pane)
-            settle(pane, 0.2)
-            h2, v2 = read_position(pane, seg)
-            return t in v2
-        if t not in visible and header is not None and header > t:
-            scroll_keys(pane, PGUP, 1)             # overshot: back, so the prompt is on screen again
-            return False
-        scroll_keys(pane, PGDN, 1)
-    return False
-
-
 def scroll_keys(pane, keys, count):
     """Send `count` copies of `keys` in one call, then wait for Claude to redraw: first for the screen to differ from
     before (a big batch is chewed through before anything is redrawn), then for it to stop changing. If the view was
@@ -174,8 +144,8 @@ def scroll_keys(pane, keys, count):
 
 def jump_scroll(pane, n, log=lambda m: None):
     """Scroll Claude's normal view (PgUp/PgDn, several in one call, never transcript mode) until turn n's prompt
-    is the pinned header, then click it: Claude jumps to the real prompt. The last turn goes to the bottom
-    instead (the end of its answer). Claude keeps its input box."""
+    is in view, then bring it to the top (see search()). The last turn goes to the bottom instead (the end of its
+    answer). Claude keeps its input box."""
     info = _guard(pane)
     path = turns.find_session_file(info["session"]) if info["session"] else None
     if not path:
@@ -186,90 +156,183 @@ def jump_scroll(pane, n, log=lambda m: None):
     if target is None:
         raise JumpError("no turn %d in this session" % n)
     if target not in seg:
-        raise JumpError("turn %d is above the last compaction: Claude no longer shows it, so the pane cannot go there" % n)
+        raise JumpError("turn %d is still waiting in the queue" % n)
     t = seg.index(target)
     if in_transcript(pane):
         leave(pane)
-    if t == len(seg) - 1:                         # the newest turn: its answer ends at the bottom
-        _raw(pane, CTRL_END)
-        settle(pane)
-        return {"turn": n, "sent": 1, "corrections": 0, "landed_on": "the end of turn %d" % n}
-    # The turn at the top of the window only ever moves one way as we scroll, so this is a search for the scroll
-    # position `net` (pages up from the bottom) where that turn is t. lo: the furthest position still below the
-    # target (turn at the top is after t); hi: the nearest position past it. Between them: interpolate.
-    lo, hi = (0, len(seg)), None
-    prev = None                                   # the observation before the last one (net, turn)
-    step = 3
-    sent, net = 0, 0
-    hopped, pages = None, 1
     _raw(pane, CTRL_END)                          # the bottom is a known place
     settle(pane)
-    for rnd in range(30):
-        header, visible = read_position(pane, seg)
-        cur = header if header is not None else (visible[0] if visible else None)
-        log("round %d: header=%s visible=%s net=%d lo=%s hi=%s" % (rnd, header, visible, net, lo, hi))
-        if t in visible and t != header:
-            top = align_to_top(pane, seg, t)
-            return {"turn": n, "sent": sent, "corrections": rnd, "landed_on": "turn %d %s" % (n, "at the top" if top else "on screen")}
-        if header == t:
-            settle(pane, 0.1)
-            h1, v1 = read_position(pane, seg)
-            if t in v1 and t != h1:
-                top = align_to_top(pane, seg, t)
-                return {"turn": n, "sent": sent, "corrections": rnd, "landed_on": "turn %d %s" % (n, "at the top" if top else "on screen")}
-            if h1 == t:
-                _click_top_row(pane)
-                settle(pane, 0.2)
-                h2, v2 = read_position(pane, seg)
-                if t in v2:
-                    return {"turn": n, "sent": sent, "corrections": rnd, "landed_on": "turn %d (clicked the header)" % n}
-            continue                              # the view moved meanwhile: read again
-        if header is not None and header > t and header - t <= HOP_RANGE:
-            # Close above the target: hop. Clicking the pinned header jumps to that prompt whatever the length of its
-            # answer, and a page up from there is inside the previous turn's answer: two keystrokes per turn, not the
-            # length of the answer. If a hop made no progress (the header is the real prompt, or the page stayed in
-            # the same answer), page up further instead of clicking again.
-            if header == hopped:
-                pages += 1
-                scroll_keys(pane, PGUP, pages)
-            else:
-                _click_top_row(pane)
-                settle(pane, 0.2)
-                pages, hopped = 1, header
-                scroll_keys(pane, PGUP, 1)
-            sent += pages
-            net = 0
-            lo, hi, prev, step = (0, len(seg)), None, None, 3
-            continue
-        if cur is None and net > 0:
-            cur = -1                              # scrolled up and no header: above the first prompt
-        if cur is not None:
-            if cur > t:
-                lo = max(lo, (net, cur), key=lambda o: o[0])
-            else:
-                hi = (net, cur) if hi is None else min(hi, (net, cur), key=lambda o: o[0])
-        if cur is None:                           # inside a long answer at the bottom, no header yet
-            goal = net + step
-        elif hi is None:                          # not past the target yet: gallop up
-            if prev is not None and prev[1] != cur and net != prev[0]:
-                per_turn = abs(net - prev[0]) / float(abs(prev[1] - cur))   # pages per turn, measured
-                goal = net + max(1, int(round(per_turn * (cur - t) * 0.9)))
-            else:
-                step = max(2, step * 2)           # no progress: the answer is long, double the step
-                goal = net + step
-        else:                                     # bracketed: interpolate between lo and hi, strictly inside
-            (n_lo, c_lo), (n_hi, c_hi) = lo, hi
-            frac = (c_lo - t) / float(max(1, c_lo - c_hi))
-            goal = n_lo + int(round(frac * (n_hi - n_lo)))
-            goal = max(n_lo + 1, min(n_hi - 1, goal)) if n_hi - n_lo > 1 else n_lo
-            if net == goal:
-                goal = net + (1 if cur > t else -1)
-        if cur is not None:
-            prev = (net, cur)
+    if t == len(seg) - 1:                         # the newest turn: its answer ends at the bottom
+        return {"turn": n, "sent": 1, "corrections": 0, "landed_on": "the end of turn %d" % n}
+    found = search(pane, seg, t, PGUP, log)         # from the bottom up
+    if found is None:                             # reached the top short of it: from the top down (pages counted afresh)
+        found = search(pane, seg, t, PGDN, log)
+    if found is None:                             # no look was sure of anything (long answers, prompts alike): every page
+        found = search(pane, seg, t, PGUP, log, crawl=True)
+    if found is None:
+        raise JumpError("turn %d is not on Claude's screen any more (it may have been dropped at a compaction)" % n)
+    sent, rnd, top = found
+    return {"turn": n, "sent": sent, "corrections": rnd, "landed_on": "turn %d %s" % (n, "at the top" if top else "on screen")}
+
+
+SCROLLED_HINT = "Jump to bottom"                  # Claude shows it while its view is scrolled up
+
+
+def _prompt_rows(text, seg):
+    """[(screen row, the turns its '❯ ' prompt could be)], top to bottom, for the prompts that match a turn."""
+    heads = [_norm(t["text"]) for t in seg]
+    rows = [(r, {i for i, h in enumerate(heads) if _matches(_norm(l[2:]), h)})
+            for r, l in enumerate(text.splitlines()) if l.startswith("❯ ")]
+    return [(r, c) for r, c in rows if c]
+
+
+def in_view(pane, items, prev=None):
+    """The number of the turn Claude's view is at, read off its screen (no keys sent): the first prompt below the top
+    row if it is in the top half, else the turn before it, whose answer fills the top; with no prompt in view, the
+    header. None when the screen does not say. `prev`: the turn last seen there, to tell same-text prompts apart."""
+    seg = segment(items)
+    text = screen(pane)
+    rows = _prompt_rows(text, seg)
+    header, starts, length = observe(text, seg)
+    near = next((i for i, t in enumerate(seg) if t["n"] == prev), None)
+    pick = lambda c: min(c, key=lambda i: (abs(i - near), -i)) if near is not None else max(c)
+    run = [r for r, _ in rows if r != 0]
+    if starts:
+        a = pick(starts)
+        i = a if run[0] < len(text.splitlines()) // 2 or a == 0 else a - 1
+    elif header:
+        i = pick(header)
+    elif SCROLLED_HINT not in text and seg:
+        i = len(seg) - 1                          # not scrolled up: the end of the newest turn
+    else:
+        return None
+    return seg[i]["n"]
+
+
+def observe(text, seg):
+    """One look at the screen, as everything it could mean: (header, starts, length). `header`: the turns the first
+    row's prompt could be. The prompts below it are consecutive turns: `starts` is where in the session that run could
+    begin, `length` how many there are (0: inside an answer, no prompt in view)."""
+    rows = _prompt_rows(text, seg)
+    header = rows[0][1] if rows and rows[0][0] == 0 else set()
+    run = [c for r, c in rows if r != 0]
+    if not run:
+        return header, set(), 0
+    starts = {a for a in run[0] if all(a + j in run[j] for j in range(len(run)))}
+    if not starts:                                # a prompt half covered or drawn differently: trust the first alone
+        run, starts = run[:1], set(run[0])
+    return header, starts, len(run)
+
+
+def _narrow(looks, up=True):
+    """Each look's meanings, narrowed by the others: the further up a look was taken (larger key), the earlier its run
+    starts; a header is a prompt before its own run. `up`: keys count pages up from the bottom (else down from the
+    top). A look nothing is left of keeps what it had (a screen drawn oddly)."""
+    if not up:
+        return {-x: v for x, v in _narrow({-x: v for x, v in looks.items()}).items()}
+    cur = {x: (set(h), set(st), ln) for x, (h, st, ln) in looks.items()}
+    for _ in range(3):
+        for x, (h, st, ln) in cur.items():
+            uppers = [max(o[1]) for y, o in cur.items() if y < x and o[1]]
+            lowers = [min(o[1]) for y, o in cur.items() if y > x and o[1]]
+            hi_, lo_ = min(uppers, default=None), max(lowers, default=None)
+            keep = {a for a in st if (hi_ is None or a <= hi_) and (lo_ is None or a >= lo_)
+                    and (not h or a > min(h))} or st
+            top = max(keep) if keep else hi_          # the header is above its own run
+            # and no later than a header further down (not "no earlier than one further up": the first row can be a
+            # queued prompt, which is not the header there)
+            h_hi = min([max(o[0]) for y, o in cur.items() if y < x and o[0]], default=None)
+            cur[x] = ({c for c in h if (top is None or c < top or (not keep and c <= top))
+                       and (h_hi is None or c <= h_hi)} or h, keep, ln)
+    return cur
+
+
+def _sides(look, t):
+    """Where turn t is from a look, under each of its meanings: "here", "up" or "down" ("?": cannot say)."""
+    header, starts, length = look
+    if header == {t}:
+        return {"here"}
+    if starts:
+        return {"here" if a <= t < a + length else ("up" if t < a else "down") for a in starts}
+    if header and all(h > t for h in header):
+        return {"up"}
+    return {"?"}
+
+
+def search(pane, seg, t, away, log, crawl=False):
+    """Scroll from the end the view is at (the bottom when `away` is PgUp, the top when PgDn) until turn t's prompt is
+    in view. Positions count pages from that end. Gallop away from it until a look shows t is behind, then halve the
+    bracket; inside long answers, where a look shows no prompt, crawl through it a page at a time (pages overlap, so a
+    page further on that still shows nothing has not passed t). `crawl`: a page at a time all the way, every look
+    narrowing the next. → (keys sent, rounds, at the top), or None when the view reached the far end first."""
+    further, behind = ("up", "down") if away == PGUP else ("down", "up")
+    back = PGDN if away == PGUP else PGUP
+    looks, net, step, sent = {}, 0, 1, 0
+
+    def look(rnd):
+        txt = screen(pane)
+        looks[net] = observe(txt, seg)
+        cur = _narrow(looks, away == PGUP)
+        side = {}
+        for x in sorted(cur):
+            s = _sides(cur[x], t)
+            if s - {further, "?"} == set() and "?" in s and side.get(x - 1) == further:
+                s = {further}                     # nothing in view a page past a "further": still further
+            side[x] = s.pop() if len(s) == 1 else "?"
+        log("round %d: %s net=%d header=%s starts=%s side=%s" % (rnd, "up" if away == PGUP else "down", net,
+            sorted(cur[net][0]), sorted(cur[net][1]), side[net]))
+        return txt, cur, side
+
+    for rnd in range(5000 if crawl else 200):
+        txt, cur, side = look(rnd)
+        if side[net] == "here":
+            # Bring it to the top: a page down at a time until it slips under the top, where Claude pins it as the
+            # header, then click the header and the real prompt comes to the top. A prompt typed while Claude was
+            # working never becomes the header: then a page back (pages overlap, so it is in view again).
+            toward = -1 if away == PGUP else 1     # a page down, in this search's count
+            for k in range(60):
+                header, starts, length = cur[net]
+                if k and t in header and not seg[t].get("queued"):
+                    # t just slipped under the top: the header is the last prompt above, so not one before t
+                    header = {c for c in header if c >= t}
+                if header == {t}:
+                    _click_top_row(pane)
+                    settle(pane, 0.2)
+                    return sent + 1, rnd + k, True
+                if not (starts and all(a <= t < a + length for a in starts)):
+                    scroll_keys(pane, PGUP, 1)
+                    return sent + 1, rnd + k, False
+                if k == 59:
+                    return sent, rnd + k, False   # still in view, not at the top
+                scroll_keys(pane, PGDN, 1)
+                sent += 1
+                net += toward
+                txt, cur, side = look(rnd + k)
+        lo = max([x for x, v in side.items() if v == further], default=0)
+        hi = min([x for x, v in side.items() if v == behind], default=None)
+        if crawl:
+            if hi is not None:
+                raise JumpError("turn %d is not on Claude's screen" % seg[t]["n"])
+            goal = net + 1
+        elif hi is None:
+            goal = max(looks) + step              # not past it yet: gallop
+            step = min(step * 2, 32)
+        else:
+            todo = [x for x in range(lo + 1, hi) if x not in looks]
+            if not todo:
+                raise JumpError("turn %d is not on Claude's screen (it may have been dropped at a compaction)" % seg[t]["n"])
+            mid = (lo + hi) // 2
+            goal = mid if mid in todo and side[net] != "?" else todo[0]
         delta = goal - net
-        if delta == 0:
-            delta = 1 if (cur is None or cur > t) else -1
-        scroll_keys(pane, PGUP if delta > 0 else PGDN, abs(delta))
+        scroll_keys(pane, away if delta > 0 else back, abs(delta))
         sent += abs(delta)
-        net = goal if goal != net else net + delta
-    raise JumpError("could not bring turn %d on screen" % n)
+        if delta > 0:
+            # one key more: if it moves nothing, the view is at the far end (and the count may be off, if part of
+            # the batch was swallowed there): stop, so the caller can count from that end instead
+            before = screen(pane)
+            scroll_keys(pane, away, 1)
+            sent += 1
+            if screen(pane) == before:
+                return None
+            goal += 1
+        net = goal

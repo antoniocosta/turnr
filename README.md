@@ -57,12 +57,21 @@ macOS, and Python 3 (standard library only).
 | click, or `Enter` | scroll the agent's pane to that turn and focus it |
 | `j` / `k`, arrows, `PgUp` / `PgDn`, `g` / `G` | move through the list |
 | `y` | copy the selected turn's text (`pbcopy`, `$TURNR_COPY`, or the terminal clipboard via OSC 52) |
+| click `⌕`, or `p` | pin the turn (click `unpin`, or `p` again, to unpin) |
 | `m` | let the terminal select text instead of the mouse driving the panel (and back) |
 | `q` | close |
 
-The turn the agent's view is at is highlighted; hovering or moving the cursor highlights another. The newest turn goes
-to the end of its answer. A prompt typed while the agent was busy shows at once as `~ waiting`. Dividers mark
+The turn the agent's view is at is highlighted, and the highlight follows the agent: scroll its pane and the panel
+selects the turn you scrolled to (turnr reads the agent's screen for this, sending no keys). Clicking the turn the view
+is already at does nothing but focus the agent. Hovering or moving the cursor highlights another. The newest turn goes
+to the end of its answer. A prompt relayed by another session through herdr shows its sender short
+(`Stash › D-57 …` for `[From Stash (~/dev/Stash) via herdr] D-57 …`). A prompt typed while the agent was busy shows at once as `~ waiting`. Dividers mark
 compactions.
+
+Pin the turns you keep coming back to: hover the `⌕` after a turn's number and it becomes `⚲ pin`; click it and the turn
+moves to a block at the bottom of the list, just above the status lines, which stays in view however many turns pile up
+above it. The newest pin goes lowest. Click `unpin` on a pinned turn to put it back in its place. Pins are remembered per
+session, in turnr's state directory.
 
 Colours are herdr's own theme, role for role as in its sidebar (read from your herdr config), so the panel matches
 whatever theme you use.
@@ -75,16 +84,18 @@ that reads the text on stdin), `TURNR_RULE` (a theme role or `#rrggbb` for the f
 
 | Agent | The list comes from | The pane is moved with |
 | --- | --- | --- |
-| Claude Code | its session file (`~/.claude/projects/…`), read incrementally and cached | PgUp / Ctrl+End in batches, then a click on the pinned prompt header, which jumps to that prompt |
+| Claude Code | its session file (`~/.claude/projects/…`), read incrementally and cached | PgUp / PgDn / Ctrl+End in batches, the position read from the prompts on screen, then a click on the pinned prompt header, which jumps to that prompt |
 | Codex | its rollout file (`~/.codex/sessions/…/rollout-*.jsonl`) | like pi: PgUp a page at a time, prompts recognised by their text (`› …`), wheel ticks to align |
 | pi | its session file (herdr reports the path) | PgUp one page at a time, mouse-wheel ticks to put the prompt on the top row; prompts are recognised on screen by their text |
 | agy | the screen: the `> ` prompt lines in herdr's scrollback | herdr's `pane.scroll`, a single exact call |
 
 Limits:
 
-- Claude Code shows only the turns after its last compaction, so earlier turns are listed (click to read them in the
-  panel) but the pane cannot go there. pi keeps part of the compacted turns on screen; turnr tells you when one is
-  gone instead of guessing.
+- Turns before a compaction are jumped to while the agent still has them on screen (Claude Code and pi keep them); one
+  that is gone opens as text in the panel instead.
+- Claude Code: a prompt typed while it was working is brought into view but not to the top row (it never becomes the
+  pinned header the click needs). Two identical prompts in a row with long answers between (`yes`, `yes`) can be
+  impossible to tell apart: turnr then says so rather than guessing.
 - agy: only what is in the terminal's scrollback can be listed. No word and tool counts.
 - Claude Code must be in its fullscreen mode (`"tui": "fullscreen"`) for the pinned header that jumps rely on.
 - pi and Codex jump one page at a time, so a far turn in a long session takes seconds.
