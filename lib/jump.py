@@ -23,7 +23,11 @@ SAFE_STATES = ("idle", "working", "done")
 
 
 class JumpError(Exception):
-    pass
+    gone = False            # True: the turn is not on the agent's screen (the panel then shows it from the file)
+
+
+class NotOnScreen(JumpError):
+    gone = True
 
 
 def _herdr(*args):
@@ -170,7 +174,7 @@ def jump_scroll(pane, n, log=lambda m: None):
     if found is None:                             # no look was sure of anything (long answers, prompts alike): every page
         found = search(pane, seg, t, PGUP, log, crawl=True)
     if found is None:
-        raise JumpError("turn %d is not on Claude's screen any more (it may have been dropped at a compaction)" % n)
+        raise NotOnScreen("turn %d is not on Claude's screen any more (it may have been dropped at a compaction)" % n)
     sent, rnd, top = found
     return {"turn": n, "sent": sent, "corrections": rnd, "landed_on": "turn %d %s" % (n, "at the top" if top else "on screen")}
 
@@ -312,7 +316,7 @@ def search(pane, seg, t, away, log, crawl=False):
         hi = min([x for x, v in side.items() if v == behind], default=None)
         if crawl:
             if hi is not None:
-                raise JumpError("turn %d is not on Claude's screen" % seg[t]["n"])
+                raise NotOnScreen("turn %d is not on Claude's screen" % seg[t]["n"])
             goal = net + 1
         elif hi is None:
             goal = max(looks) + step              # not past it yet: gallop
@@ -320,7 +324,7 @@ def search(pane, seg, t, away, log, crawl=False):
         else:
             todo = [x for x in range(lo + 1, hi) if x not in looks]
             if not todo:
-                raise JumpError("turn %d is not on Claude's screen (it may have been dropped at a compaction)" % seg[t]["n"])
+                raise NotOnScreen("turn %d is not on Claude's screen (it may have been dropped at a compaction)" % seg[t]["n"])
             mid = (lo + hi) // 2
             goal = mid if mid in todo and side[net] != "?" else todo[0]
         delta = goal - net

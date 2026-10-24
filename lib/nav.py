@@ -19,7 +19,11 @@ _SGR = re.compile(r"\x1b\[[0-9;]*m")
 
 
 class JumpError(Exception):
-    pass
+    gone = False            # True: the turn is not on the agent's screen (the panel then shows it from the file)
+
+
+class NotOnScreen(JumpError):
+    gone = True
 
 
 def run(*args):
@@ -171,7 +175,7 @@ def jump(pane, agent, n, items, marker="", log=lambda m: None):
         elif found and min(found) > t:
             direction = -1
         if rows == prev:
-            raise JumpError("turn %d is not on %s's screen (it may have been dropped at a compaction)" % (n, agent))
+            raise NotOnScreen("turn %d is not on %s's screen (it may have been dropped at a compaction)" % (n, agent))
         prev = rows
         send(pane, agent, PGUP if direction < 0 else PGDN)
         sent += 1

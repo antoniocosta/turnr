@@ -313,6 +313,7 @@ class Panel:
         if i is None:
             return
         self.viewed = n
+        self.gone.discard(n)                            # on the agent's screen after all: jump to it again
         self.current = None if i == self.newest_turn() else i
         self.sel, self.follow = i, i == self.last_main()
 
@@ -615,8 +616,11 @@ class Panel:
             self.current, self.viewed = (None if i == self.newest_turn() else i), it["n"]
             self.say("at turn %d" % it["n"], 8)
         except (OSError, *{a.error for a in agents.ADAPTERS.values()}) as e:
-            if compacted:                               # gone from the agent's screen: read it here instead
-                self.gone.add(it["n"])
+            # gone from the agent's screen: read it here instead. Any other failure (a dialog open, a send that
+            # failed) says so and is tried again next time, whether by a click or by Enter
+            if getattr(e, "gone", False):
+                if compacted:
+                    self.gone.add(it["n"])
                 self.open_reader(i)
             self.say(str(e)[:200], 8)
 
